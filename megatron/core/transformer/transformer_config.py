@@ -953,7 +953,8 @@ class TransformerConfig(ModelParallelConfig):
 
     The single replica expert dispatcher uses this value to select its weight transport.
     ``replica_peer_tma`` selects the existing symmetric-memory peer-TMA transport.
-    ``replica_hybridep`` and ``replica_nccl`` are reserved, unimplemented transports.
+    ``replica_nccl`` selects packed NCCL P2P for BF16 weights with host planning.
+    ``replica_hybridep`` is a reserved, unimplemented transport.
     Existing configs using the old ``replica_hybridep`` name must use ``replica_peer_tma``.
     """
 
@@ -2132,6 +2133,8 @@ class TransformerConfig(ModelParallelConfig):
             replica_mxfp8 = (
                 self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
             )
+            if self.moe_scheduler_expert_dispatcher_type == "replica_nccl" and self.fp8:
+                raise ValueError("replica_nccl currently supports BF16 weights only.")
             required_values = {
                 "moe_token_dispatcher_type": "flex",
                 "moe_flex_dispatcher_backend": "hybridep",
@@ -3213,6 +3216,18 @@ class TransformerConfig(ModelParallelConfig):
             )
             setattr(self, migration_attr, migration_value)
         self.cuda_graph_modules = normalized_scopes
+        if (
+            self.moe_enable_scheduler
+            and self.moe_scheduler_expert_dispatcher_type == "replica_nccl"
+            and self.cuda_graph_impl != "none"
+            and (
+                self.cuda_graph_impl == "full_iteration"
+                or not self.cuda_graph_modules
+                or {CudaGraphModule.moe, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess}
+                & set(self.cuda_graph_modules)
+            )
+        ):
+            raise ValueError("replica_nccl host schedules do not support MoE CUDA graph capture.")
         assert all(
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules
         ), f"cuda_graph_modules must be a list of CudaGraphModule, got {self.cuda_graph_modules}."

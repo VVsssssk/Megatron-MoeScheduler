@@ -7,7 +7,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.echo_moe_scheduler import EchoLoadPlanner
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_scheduler import (
@@ -21,6 +24,8 @@ from megatron.core.transformer.moe.replica_weight_triton import _grad_arguments,
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+pytestmark = pytest.mark.launch_on_gb200
 
 
 @pytest.fixture(autouse=True)
@@ -300,14 +305,16 @@ def test_replica_dispatch_preserves_runtime_backward_order():
     hidden = dispatcher.after_token_combine(hidden)
     hidden.backward()
 
+    # Pending reductions run after token dispatch backward; FC2's optional
+    # earlier launch belongs to the expert runtime, not this pending hook.
     assert events == [
         "forward_prefetch",
         "backward_prefetch",
         "combine_backward",
         "wait_prefetch",
         "expert_backward",
-        "start_grad_reduce",
         "dispatch_backward",
+        "start_grad_reduce",
         "wait_grad_reduce",
     ]
     assert not any(slot.in_use for slot in dispatcher._plan_slots)
@@ -440,6 +447,38 @@ def test_replica_scheduler_accepts_native_mxfp8_with_router_padding():
     assert config.moe_router_padding_for_quantization
 
 
+def test_nccl_replica_scheduler_rejects_mxfp8():
+    with pytest.raises(ValueError, match="replica_nccl.*BF16 weights only"):
+        _scheduler_config(
+            moe_scheduler_expert_dispatcher_type="replica_nccl",
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "impl,scopes",
+    [("local", []), ("local", ["moe"]), ("transformer_engine", ["moe"]), ("full_iteration", [])],
+)
+def test_nccl_replica_scheduler_rejects_moe_capture(impl, scopes):
+    with pytest.raises(ValueError, match="replica_nccl host schedules"):
+        _scheduler_config(
+            moe_scheduler_expert_dispatcher_type="replica_nccl",
+            cuda_graph_impl=impl,
+            cuda_graph_modules=scopes,
+        )
+
+
+def test_nccl_replica_scheduler_allows_attention_capture():
+    config = _scheduler_config(
+        moe_scheduler_expert_dispatcher_type="replica_nccl",
+        cuda_graph_impl="local",
+        cuda_graph_modules=["attn"],
+    )
+    assert config.moe_scheduler_expert_dispatcher_type == "replica_nccl"
+
+
 @pytest.mark.parametrize(
     ("fp8", "fp8_recipe", "fp8_param"),
     [("e4m3", "mxfp8", False), ("e4m3", "tensorwise", True), ("hybrid", "mxfp8", True)],
@@ -513,13 +552,21 @@ def test_moe_layer_scheduler_helper_uses_unified_scheduler_output():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_moe_layer_auto_instantiates_scheduler_from_config():
+@pytest.mark.parametrize("backend", ["replica_peer_tma", "replica_nccl"])
+def test_moe_layer_auto_instantiates_scheduler_from_config(backend):
     Utils.initialize_model_parallel(1, 1)
     try:
-        config = _scheduler_config(moe_scheduler_num_idle_experts=2, use_cpu_initialization=False)
+        model_parallel_cuda_manual_seed(123)
+        config = _scheduler_config(
+            moe_scheduler_num_idle_experts=2,
+            use_cpu_initialization=False,
+            moe_scheduler_expert_dispatcher_type=backend,
+        )
+        # Replica runtime binding requires discrete TE grouped expert weights
+        # and the operation fuser, matching the scheduler configuration.
         submodules = get_submodules(
-            get_gpt_layer_local_submodules(
-                num_experts=config.num_moe_experts, moe_grouped_gemm=True
+            get_gpt_layer_with_transformer_engine_submodules(
+                num_experts=config.num_moe_experts, moe_grouped_gemm=True, use_te_op_fuser=True
             ).mlp
         )
         assert isinstance(submodules, MoESubmodules)

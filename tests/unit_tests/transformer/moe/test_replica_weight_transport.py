@@ -27,6 +27,8 @@ from megatron.core.transformer.moe.replica_weight_transport import (
     create_replica_weight_transport,
 )
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 class _RecordingTransport(ReplicaWeightTransport):
     capabilities = ReplicaTransportCapabilities(
@@ -109,7 +111,7 @@ def _runtime():
     return runtime
 
 
-@pytest.mark.parametrize("backend", ["replica_hybridep", "replica_nccl"])
+@pytest.mark.parametrize("backend", ["replica_hybridep"])
 def test_reserved_backends_fail_before_allocating_or_importing_peer_tma(backend, monkeypatch):
     import builtins
 
