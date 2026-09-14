@@ -20,7 +20,11 @@ import torch.distributed as dist
 from megatron.core.fp8_utils import is_mxfp8tensor
 from megatron.core.transformer.moe.replica_weight_transport import (
     ReplicaGradDestination,
+    ReplicaOwnership,
+    ReplicaPlacement,
+    ReplicaPreparedPlan,
     ReplicaTransportConfig,
+    ReplicaWeightLayout,
     ReplicaWeightSource,
     ReplicaWeightTransport,
     finalize_replica_weight_transports,
@@ -39,23 +43,26 @@ def _discard_runtime_parameter_grad(parameter: torch.nn.Parameter) -> None:
     parameter.grad = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, eq=False)
 class ReplicaPlan:
     """Transport-facing result of replica placement planning.
 
     Attributes:
-        virtual_experts: Rank-major runtime expert ids with shape
-            ``[num_tokens, router_topk]``.
-            A native id is ``destination * num_runtime_experts_per_gpu +
-            local_expert``; a replica id adds ``num_home_experts_per_gpu`` and
-            the replica slot instead.
+        virtual_experts: Rank-major physical-slot-to-logical-expert map,
+            with shape ``[num_experts + num_replica_slots]``.
         experts_to_copy: Semantic expert ids assigned to each rank's replica
             slots, with shape ``[ep_size, num_replica_slots_per_gpu]``. Unused
             slots contain ``-1``.
+        version: Dispatcher-local generation, incremented on every placement.
+
+    Identity hashing and weak references let the runtime cache private plans
+    without retaining finished microbatches. Tensors must remain immutable
+    through the forward/backward lifetime, including CUDA graph replay.
     """
 
     virtual_experts: torch.Tensor
     experts_to_copy: torch.Tensor
+    version: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -493,6 +500,11 @@ class ReplicaExpertRuntime:
         self._prefetch_plan = None
         self._prefetch_handle = None
         self._completed_plan = None
+        self._completed_handle = None
+        self._prepared_plans: weakref.WeakKeyDictionary[ReplicaPlan, ReplicaPreparedPlan] = (
+            weakref.WeakKeyDictionary()
+        )
+        self.ownership = ReplicaOwnership(home_experts=self.num_local_home_experts)
         self._backward_plan = None
         self._grad_reduce_plan = None
         self._grad_reduce_started: set[int] = set()
@@ -512,7 +524,7 @@ class ReplicaExpertRuntime:
                 f"num_local_home_experts={self.num_local_home_experts}."
             )
         projection_specs, self.device = _collect_replica_projection_specs(
-            experts, num_local_experts=self.num_local_home_experts, backend_name="Replica-HybridEP"
+            experts, num_local_experts=self.num_local_home_experts, backend_name="Replica"
         )
         self.weight_format = projection_specs[0].weight_format
         mxfp8 = self.weight_format == "mxfp8"
@@ -634,9 +646,7 @@ class ReplicaExpertRuntime:
             if leader is None:
                 continue
             peek = getattr(
-                leader,
-                "peek_group_for_backward" if backward else "peek_group_for_forward",
-                None,
+                leader, "peek_group_for_backward" if backward else "peek_group_for_forward", None
             )
             if callable(peek):
                 materialized = peek()
@@ -662,9 +672,7 @@ class ReplicaExpertRuntime:
             if leader is None:
                 continue
             peek = getattr(
-                leader,
-                "peek_group_for_backward" if backward else "peek_group_for_forward",
-                None,
+                leader, "peek_group_for_backward" if backward else "peek_group_for_forward", None
             )
             if not callable(peek):
                 continue
@@ -717,11 +725,30 @@ class ReplicaExpertRuntime:
                 ReplicaWeightSource(
                     data=data,
                     scales=scales,
+                    layout=(
+                        ReplicaWeightLayout.PLAIN
+                        if projection.weight_format == "bf16"
+                        else (
+                            ReplicaWeightLayout.COLUMNWISE
+                            if backward
+                            else ReplicaWeightLayout.ROWWISE
+                        )
+                    ),
                     data_bases=binding.data_bases,
                     scale_bases=binding.scale_bases,
                 )
             )
         return tuple(sources)
+
+    def _prepare_transport_plan(self, plan: ReplicaPlan) -> ReplicaPreparedPlan:
+        """Cache only scheduling metadata for this immutable microbatch plan."""
+        prepared = self._prepared_plans.get(plan)
+        if prepared is None:
+            prepared = self.transport.prepare_plan(
+                ReplicaPlacement(plan.experts_to_copy, self.ownership, plan.version)
+            )
+            self._prepared_plans[plan] = prepared
+        return prepared
 
     @torch.no_grad()
     def start_prefetch(
@@ -731,29 +758,33 @@ class ReplicaExpertRuntime:
         if self._prefetch_plan is not None:
             raise RuntimeError("Replica weight prefetch is already outstanding.")
         self._validate_plan(plan)
+        prepared = self._prepare_transport_plan(plan)
         # A GTP parameter stores only its local shard. Materialization consumes
         # any one-weight-ahead gather (or performs the cold synchronous gather)
         # and stages the full native experts before the push reads them.
         self.prepare_source_weights(direction)
         self._prefetch_handle = self.transport.start_weight_sync(
-            sources=self._transport_sources(direction),
-            experts_to_copy=plan.experts_to_copy,
+            sources=self._transport_sources(direction), plan=prepared
         )
         self._prefetch_plan = plan
+        self._completed_plan = None
+        self._completed_handle = None
 
     @torch.no_grad()
     def wait_prefetch(self, plan: ReplicaPlan) -> None:
         """Make the current stream wait for the outstanding push of ``plan``."""
         if self._prefetch_plan is None:
-            # A repeated wait for the plan already resident is a no-op; anything
-            # else means the planner never started the transport.
+            # A resident plan still needs a dependency on every consumer stream.
             if plan is None or plan is not self._completed_plan:
                 raise RuntimeError("Replica weights require a started prefetch before use.")
         elif self._prefetch_plan is not plan:
             raise RuntimeError("Replica weight prefetch plan changed while outstanding.")
-        if self._prefetch_handle is not None:
-            self.transport.wait_weight_sync(self._prefetch_handle)
+        handle = (
+            self._prefetch_handle if self._prefetch_plan is not None else self._completed_handle
+        )
+        self.transport.wait_weight_sync(handle)
         self._completed_plan = plan
+        self._completed_handle = handle
         self._prefetch_plan = None
         self._prefetch_handle = None
 
@@ -782,7 +813,7 @@ class ReplicaExpertRuntime:
                 )
                 for projection in self.projections
             ),
-            experts_to_copy=plan.experts_to_copy,
+            plan=self._prepare_transport_plan(plan),
             projections=(projection,),
         )
         self._grad_reduce_plan = plan
@@ -843,6 +874,12 @@ class ReplicaExpertRuntime:
         self.projections.clear()
         self.last_plan = None
         self.transport.destroy()
+        self._prepared_plans.clear()
+        self._prefetch_handle = None
+        self._completed_handle = None
+        self._grad_reduce_handles.clear()
+        self._prefetch_plan = self._completed_plan = self._backward_plan = None
+        self._grad_reduce_plan = None
         self.transport = None
         self._destroyed = True
         _replica_expert_runtimes.discard(self)

@@ -27,6 +27,7 @@ from megatron.core.transformer.enums import (
     InferenceCudaGraphScope,
     LayerType,
 )
+from megatron.core.transformer.moe.replica_weight_transport import REPLICA_EXPERT_DISPATCHER_TYPES
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import experimental_api
 
@@ -945,11 +946,15 @@ class TransformerConfig(ModelParallelConfig):
     moe_scheduler_planner_type: Literal['echo', 'eplb', 'moon_ep'] = "echo"
     """Planner backend used by MoEScheduler. Supports 'echo', 'eplb', and 'moon_ep'."""
 
-    moe_scheduler_expert_dispatcher_type: Literal['replica_hybridep'] = "replica_hybridep"
+    moe_scheduler_expert_dispatcher_type: Literal[
+        'replica_peer_tma', 'replica_hybridep', 'replica_nccl'
+    ] = "replica_peer_tma"
     """Expert-dispatch backend used by MoEScheduler.
 
     The single replica expert dispatcher uses this value to select its weight transport.
-    ``replica_hybridep`` currently selects the symmetric-memory peer-TMA transport.
+    ``replica_peer_tma`` selects the existing symmetric-memory peer-TMA transport.
+    ``replica_hybridep`` and ``replica_nccl`` are reserved, unimplemented transports.
+    Existing configs using the old ``replica_hybridep`` name must use ``replica_peer_tma``.
     """
 
     moe_scheduler_num_idle_experts: Optional[int] = None
@@ -959,11 +964,10 @@ class TransformerConfig(ModelParallelConfig):
     this to equal ``num_moe_experts``.
     """
 
-    moe_scheduler_assignment_algorithm: Literal[
-        'one_shot_greedy', 'approx_bin_packing'
-    ] = "approx_bin_packing"
+    moe_scheduler_assignment_algorithm: Literal['one_shot_greedy', 'approx_bin_packing'] = (
+        "approx_bin_packing"
+    )
     """Scheduler planner assignment algorithm. """
-
 
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
@@ -2089,10 +2093,10 @@ class TransformerConfig(ModelParallelConfig):
                     "Only moe_scheduler_planner_type='echo', 'eplb', and 'moon_ep' are "
                     "currently implemented."
                 )
-            if self.moe_scheduler_expert_dispatcher_type != "replica_hybridep":
+            if self.moe_scheduler_expert_dispatcher_type not in REPLICA_EXPERT_DISPATCHER_TYPES:
                 raise ValueError(
-                    "Only moe_scheduler_expert_dispatcher_type='replica_hybridep' is "
-                    "currently implemented."
+                    "Unsupported moe_scheduler_expert_dispatcher_type; expected one of "
+                    f"{REPLICA_EXPERT_DISPATCHER_TYPES}."
                 )
             if self.moe_scheduler_num_idle_experts is None:
                 raise ValueError(
@@ -2120,15 +2124,13 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.moe_scheduler_num_idle_experts == 0:
                 raise ValueError(
-                    "moe_scheduler_expert_dispatcher_type='replica_hybridep' requires "
+                    "Replica expert dispatch requires "
                     "at least one replica slot per expert-parallel rank."
                 )
             if self.moe_expert_rank_capacity_factor is None:
                 self.moe_expert_rank_capacity_factor = 1.0
             replica_mxfp8 = (
-                self.fp8 == "e4m3"
-                and self.fp8_recipe == Fp8Recipe.mxfp8
-                and self.fp8_param
+                self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
             )
             required_values = {
                 "moe_token_dispatcher_type": "flex",
@@ -2172,8 +2174,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_latent_size (or hidden_size) divisible by 128",
                 ),
                 (
-                    self.moe_ffn_hidden_size is not None
-                    and self.moe_ffn_hidden_size % 128 == 0,
+                    self.moe_ffn_hidden_size is not None and self.moe_ffn_hidden_size % 128 == 0,
                     "moe_ffn_hidden_size divisible by 128",
                 ),
                 (
@@ -2195,7 +2196,7 @@ class TransformerConfig(ModelParallelConfig):
             ]
             if replica_errors:
                 raise ValueError(
-                    "Replica-HybridEP scheduler configuration is unsupported; require "
+                    "Replica scheduler configuration is unsupported; require "
                     + ", ".join(replica_errors)
                     + "."
                 )
@@ -3400,7 +3401,7 @@ class TransformerConfig(ModelParallelConfig):
                             CudaGraphModule.moe_router,
                             CudaGraphModule.moe_preprocess,
                         } & set(self.cuda_graph_modules), (
-                            'replica_hybridep supports the whole moe CUDA graph scope only; '
+                            'Replica expert dispatch supports the whole moe CUDA graph scope only; '
                             'moe_router and moe_preprocess are not supported.'
                         )
                     elif (

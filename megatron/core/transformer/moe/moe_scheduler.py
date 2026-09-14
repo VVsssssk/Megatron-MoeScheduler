@@ -24,6 +24,8 @@ from typing import Any, ClassVar, Optional
 
 import torch
 
+from megatron.core.transformer.moe.replica_weight_transport import REPLICA_EXPERT_DISPATCHER_TYPES
+
 IDENTITY_BACKEND = "identity"
 ECHO_BACKEND = "echo"
 EPLB_BACKEND = "eplb"
@@ -233,7 +235,7 @@ class MoEScheduler(torch.nn.Module):
         expert_dispatcher_type = getattr(config, "moe_scheduler_expert_dispatcher_type", None)
         if planner_type not in ("echo", "eplb", "moon_ep"):
             raise ValueError(f"Unsupported MoEScheduler planner: {planner_type}")
-        if expert_dispatcher_type != "replica_hybridep":
+        if expert_dispatcher_type not in REPLICA_EXPERT_DISPATCHER_TYPES:
             raise ValueError(
                 f"Unsupported MoEScheduler expert dispatcher: {expert_dispatcher_type}"
             )
@@ -248,9 +250,7 @@ class MoEScheduler(torch.nn.Module):
         )
 
         from megatron.core.transformer.moe.echo_moe_scheduler import EchoLoadPlanner
-        from megatron.core.transformer.moe.replica_hybridep_expert_dispatch import (
-            ReplicaHybridEPExpertDispatch,
-        )
+        from megatron.core.transformer.moe.replica_expert_dispatch import ReplicaExpertDispatch
 
         if planner_type == "echo":
             planner = EchoLoadPlanner(num_idle_experts, assignment_algorithm=assignment_algorithm)
@@ -263,7 +263,7 @@ class MoEScheduler(torch.nn.Module):
 
             ep_size = getattr(config, "expert_model_parallel_size", 1)
             planner = MoonEPLoadPlanner(num_redundant_experts=num_idle_experts // ep_size)
-        expert_dispatch = ReplicaHybridEPExpertDispatch(config=config, pg_collection=pg_collection)
+        expert_dispatch = ReplicaExpertDispatch(config=config, pg_collection=pg_collection)
         config_signature = (
             str(planner_type),
             str(expert_dispatcher_type),

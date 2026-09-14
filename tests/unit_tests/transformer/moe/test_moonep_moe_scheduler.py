@@ -16,9 +16,7 @@ from megatron.core.transformer.moe.moonep_moe_scheduler import (
     plan_replica_routes,
 )
 from megatron.core.transformer.moe.moonep_replica_triton import HAVE_TRITON
-from megatron.core.transformer.moe.replica_hybridep_expert_dispatch import (
-    ReplicaHybridEPExpertDispatch,
-)
+from megatron.core.transformer.moe.replica_expert_dispatch import ReplicaExpertDispatch
 
 
 def _route_inputs(
@@ -119,7 +117,7 @@ def test_moonep_layout_is_accepted_by_unified_replica_dispatch():
         def rank(self):
             return 0
 
-    dispatcher = ReplicaHybridEPExpertDispatch(
+    dispatcher = ReplicaExpertDispatch(
         config=SimpleNamespace(
             num_moe_experts=4, expert_model_parallel_size=1, moe_scheduler_num_idle_experts=4
         ),

@@ -163,7 +163,7 @@ planner's explicit intermediate state; the scheduler treats it as opaque and
 passes it back only to the planner that produced it. `reroute()` returns dense
 `[num_tokens, num_physical_experts]` routing and probability tensors.
 
-The `ReplicaHybridEPExpertDispatch` consumes only
+The `ReplicaExpertDispatch` consumes only
 `physical_to_logical_map` and owns the common weight-prefetch and
 gradient-reduction lifecycle. It delegates TE/GTP parameter state to
 `ReplicaExpertRuntime`, which delegates communication and transport-owned
@@ -175,21 +175,26 @@ storage to `ReplicaWeightTransport`.
 classDiagram
     MoELayer --> MoEScheduler
     MoEScheduler o-- MoELoadPlanner
-    MoEScheduler o-- ReplicaHybridEPExpertDispatch
+    MoEScheduler o-- ReplicaExpertDispatch
     MoELoadPlanner <|-- EchoLoadPlanner
     MoELoadPlanner <|-- EPLBLoadPlanner
     MoELoadPlanner <|-- MoonEPLoadPlanner
-    ExpertDispatch <|-- ReplicaHybridEPExpertDispatch
+    ExpertDispatch <|-- ReplicaExpertDispatch
     MoEPlacementResult <|-- EchoPlacementResult
     MoEPlacementResult <|-- EPLBPlacementResult
     MoEPlacementResult <|-- MoonEPPlacementResult
     EchoLoadPlanner --> EchoPlacementResult
     EPLBLoadPlanner --> EPLBPlacementResult
     MoonEPLoadPlanner --> MoonEPPlacementResult
-    MoEScheduler --> ReplicaHybridEPExpertDispatch
-    ReplicaHybridEPExpertDispatch o-- ReplicaExpertRuntime
+    MoEScheduler --> ReplicaExpertDispatch
+    ReplicaExpertDispatch o-- ReplicaExpertRuntime
     ReplicaExpertRuntime o-- ReplicaWeightTransport
     ReplicaWeightTransport <|-- PeerTmaTransport
+    ReplicaWeightTransport <|-- HybridEPWeightTransport
+    ReplicaWeightTransport <|-- NcclP2PTransport
+    ReplicaWeightTransport --> ReplicaPreparedPlan
+    ReplicaPreparedPlan --> ReplicaPlacement
+    ReplicaPlacement --> ReplicaOwnership
 ```
 
 The same architecture is available as standalone PlantUML sources:
@@ -204,7 +209,9 @@ The same architecture is available as standalone PlantUML sources:
 | Planner | `echo` | `EchoLoadPlanner` | CUDA/Triton assignment and token reroute aligned with Echo PR #2368. |
 | Planner | `eplb` | `EPLBLoadPlanner` | Greedy hot-expert replication, fixed-home LPT placement, and global round-robin rerouting. |
 | Planner | `moon_ep` | `MoonEPLoadPlanner` | PR #6892 fused per-step placement: one cooperative kernel with symmetric-memory histogram exchange. |
-| Expert dispatch | `replica_hybridep` | `ReplicaHybridEPExpertDispatch` | One replica lifecycle implementation; the type currently selects `PeerTmaTransport`. |
+| Expert dispatch | `replica_peer_tma` | `ReplicaExpertDispatch` | One replica lifecycle implementation; the type currently selects `PeerTmaTransport`. |
+| Expert dispatch | `replica_hybridep` | Same dispatcher, `HybridEPWeightTransport` | Placeholder; raises `NotImplementedError` before transport allocation. |
+| Expert dispatch | `replica_nccl` | Same dispatcher, `NcclP2PTransport` | Placeholder; raises `NotImplementedError` before transport allocation. |
 
 UltraEP is a planned integration. It should implement the same common planner
 output or expert-dispatch input semantics instead of exposing UltraEP-native
@@ -226,7 +233,7 @@ metadata in the public interface.
    expert-weight communication is in flight.
 9. The existing token dispatcher consumes the physical routing tensors and
    runs the normal dispatch, expert compute, and combine stages.
-10. During backward, `replica_hybridep` starts FC2 reduction directly behind
+10. During backward, `replica_peer_tma` starts FC2 reduction directly behind
    its wgrad GEMM, starts pending FC1/FC2 reductions after dispatch backward,
    and waits at the layer input before publishing source gradients.
 
@@ -237,10 +244,20 @@ A minimal Echo configuration is:
 ```yaml
 moe_enable_scheduler: true
 moe_scheduler_planner_type: echo
-moe_scheduler_expert_dispatcher_type: replica_hybridep
+moe_scheduler_expert_dispatcher_type: replica_peer_tma
 moe_scheduler_num_idle_experts: 4
 moe_scheduler_assignment_algorithm: approx_bin_packing
 ```
+
+**Configuration migration:** the former `replica_hybridep` value selected
+Peer-TMA, despite its name. It has been renamed to `replica_peer_tma`, which
+is also the default. Update existing YAML/CLI configurations to that value.
+`replica_hybridep` is now reserved for the actual HybridEP weight backend and
+fails with a migration message; it never silently selects a different data
+path. All three values construct `ReplicaExpertDispatch` from
+`replica_expert_dispatch.py`; the common dispatcher has no transport-specific
+name or compatibility alias. Placeholder types are accepted by configuration
+validation but cannot execute or bind weights.
 
 For MoonEP, set `moe_scheduler_planner_type: moon_ep`. The current MoonEP
 implementation allocates one replica slot for every home expert, so
@@ -259,7 +276,7 @@ Every rank owns `E / EP` native experts followed by `R / EP` replica slots. It
 requires the HybridEP flex token dispatcher, BF16 execution, TE grouped GEMM
 with the operation fuser, and fused gradient accumulation. Weights may be BF16
 or native-parameter MXFP8 E4M3; FP4 and other FP8 recipes are rejected. The
-current `replica_hybridep` type selects `PeerTmaTransport`, which requires a
+current `replica_peer_tma` type selects `PeerTmaTransport`, which requires a
 single NVLink domain and a PyTorch/NCCL build with working native NCCL
 symmetric-memory support.
 
@@ -269,7 +286,7 @@ Current constraints:
 - `num_moe_experts` and `moe_scheduler_num_idle_experts` must be divisible by
   the expert-model-parallel size.
 - `add_bias_linear` must be disabled.
-- The `replica_hybridep` expert dispatcher requires discrete native expert
+- The `replica_peer_tma` expert dispatcher requires discrete native expert
   weights and the Transformer Engine operation fuser; single grouped expert
   weights are unsupported.
 - The HybridEP flex token dispatcher requires a build with HybridEP support.
@@ -280,7 +297,7 @@ Current constraints:
   global placement rather than a historical moving-average load predictor or
   hierarchical multi-node expert-group placement.
 - CUDA graph capture is supported only at the whole-MoE scope for
-  `replica_hybridep`; separate `moe_router` and `moe_preprocess` scopes are
+  `replica_peer_tma`; separate `moe_router` and `moe_preprocess` scopes are
   rejected. MoE activation recompute is also rejected for this lifecycle.
 - When GTP exposes #6892's non-consuming peek protocol, the weight push peeks
   at gathered weights and the expert GEMMs perform the real consume. Older GTP
@@ -300,10 +317,12 @@ materialization ran.
 | `megatron/core/transformer/moe/eplb_moe_scheduler.py` | EPLB greedy replication, fixed-home LPT placement, and round-robin reroute. |
 | `megatron/core/transformer/moe/moonep_moe_scheduler.py` | MoonEP/PR #6892 planner adapter and common-IR conversion. |
 | `megatron/core/transformer/moe/moonep_replica_triton.py` | #6892 histogram/placement and route-mapping Triton kernels. |
-| `megatron/core/transformer/moe/replica_hybridep_expert_dispatch.py` | Common placement adapter and replica forward/backward lifecycle. |
+| `megatron/core/transformer/moe/replica_expert_dispatch.py` | Common placement adapter and replica forward/backward lifecycle. |
 | `megatron/core/transformer/moe/replica_expert_runtime.py` | TE/GTP runtime weights, gradient handoff, and transport coordination. |
 | `megatron/core/transformer/moe/replica_weight_transport.py` | Backend-neutral replica weight/gradient transport contract and factory. |
 | `megatron/core/transformer/moe/replica_peer_tma_transport.py` | Symmetric-memory peer-TMA transport and shared workspace. |
+| `megatron/core/transformer/moe/replica_hybridep_transport.py` | Reserved HybridEP weight backend; not implemented. |
+| `megatron/core/transformer/moe/replica_nccl_transport.py` | Reserved NCCL P2P weight backend; not implemented. |
 | `megatron/core/transformer/moe/replica_weight_triton.py` | #6892 weight transport and projection-selective gradient-reduction kernels, generalized to variable replica slots. |
 | `megatron/core/transformer/moe/moe_layer.py` | Integration between logical routing and the existing token dispatcher. |
 | `megatron/core/transformer/transformer_config.py` | Scheduler configuration and compatibility validation. |
@@ -311,6 +330,58 @@ materialization ran.
 | `tests/unit_tests/transformer/moe/test_echo_moe_scheduler.py` | Echo planner, unified replica dispatch, and `MoELayer` integration tests. |
 | `tests/unit_tests/transformer/moe/test_eplb_moe_scheduler.py` | EPLB placement, global reroute, gradient, and factory tests. |
 | `tests/unit_tests/transformer/moe/test_moonep_moe_scheduler.py` | MoonEP planner and cross-component compatibility tests. |
+| `tests/unit_tests/transformer/moe/test_replica_weight_transport.py` | Plan ownership, layout, completion lifetime, and placeholder contracts. |
+
+## Replica Transport Contract
+
+The planner chooses logical experts for execution slots. The single dispatcher
+retains an immutable placement slot through forward/backward and assigns a
+dispatcher-local generation. `ReplicaExpertRuntime` wraps that slot table in
+`ReplicaPlacement`, with a separate `ReplicaOwnership` descriptor. The current
+owner mapping is uniform and fixed; optional explicit owner tables reserve an
+extension point and are rejected by Peer-TMA. This refactor does not implement
+native-owner or optimizer-state migration, or relax the fixed-home E+R layout.
+
+`transport.prepare_plan(placement)` produces a `ReplicaPreparedPlan` belonging
+to that exact transport instance. Peer-TMA keeps device metadata; future
+HybridEP and NCCL implementations can respectively compile chunk routing or
+peer schedules. The common layer never expands chunk routing or reads the
+placement back to the CPU. Runtime caches are weak and keyed by plan identity,
+not the address of a recycled slot. A future host-scheduled backend must
+document synchronization and reject unsupported graph capture. CUDA graph
+replay can update device metadata without executing Python or incrementing a
+Python generation: cached host schedules must never assume otherwise.
+
+Each `ReplicaWeightSource` exposes canonical local-expert data and optional
+scales, with explicit plain/rowwise/columnwise layout. Tensor shape and dtype
+describe the components; wire encoding and packing belong to the transport.
+Optional pointer tables remain a Peer-TMA fast path. TE wrappers, GTP peeks,
+direction selection and optimizer handoff remain in the runtime.
+
+Each start returns a distinct `ReplicaTransferHandle`, separate from reusable
+scheduling metadata. A weight completion covers unpack and final layout;
+a gradient completion covers `native += sum(replicas)`, including local
+replicas, with FP32 accumulation and one final cast. Native gradients are not
+cleared. Reduction order can differ between backends; bitwise equivalence is
+not promised. Every wait orders its calling stream, including repeated waits
+for resident weights. Handles retain operation inputs, but backends must also
+protect allocator lifetimes and callers must not overwrite sources or buffers
+while the GPU uses them.
+
+Storage views remain stable until teardown. The existing Peer-TMA shared
+workspace and its serialized layer lifecycle are preserved; the interface
+does not promise independent concurrent storage per layer. New transports
+should first use per-layer buffers before introducing shared pools. Only
+initialized backends register finalizers, so cleanup does not import unused
+Triton/symmetric-memory dependencies. Capabilities advertise implemented
+weight formats, gradient dtypes, device planning, graph support and explicit
+ownership; placeholders advertise none. Topology compatibility remains a
+backend initialization requirement, not an automatic fallback policy.
+
+Cross-node/non-NVLink execution is not enabled by these placeholders. It also
+requires compatible planner and token-dispatch paths; current scheduler
+configuration still requires HybridEP tokens and the MoonEP planner still
+uses symmetric-memory histogram exchange.
 
 ## Extending MoE Scheduler
 
@@ -331,15 +402,17 @@ To add a replica communication mode while retaining the single expert dispatcher
 2. Keep TE, GTP, MXFP8, and optimizer semantics in `ReplicaExpertRuntime`.
 3. Register the transport against an expert-dispatch type in
    `create_replica_weight_transport()`; all types instantiate
-   `ReplicaHybridEPExpertDispatch`.
-4. Preserve asynchronous weight-sync and replica-gradient-reduction completion
-   semantics.
+   `ReplicaExpertDispatch`.
+4. Compile only backend-private schedules in `prepare_plan()` and preserve
+   layout, ownership, storage lifetime and asynchronous completion semantics.
 5. Add factory, forward/backward lifecycle, and multi-rank correctness tests.
 
 Run the focused unit tests from the Megatron-LM repository root:
 
 ```bash
-pytest tests/unit_tests/transformer/moe/test_moe_scheduler.py \
+python -m torch.distributed.run --nproc-per-node 8 -m pytest \
+  tests/unit_tests/transformer/moe/test_replica_weight_transport.py \
+  tests/unit_tests/transformer/moe/test_moe_scheduler.py \
   tests/unit_tests/transformer/moe/test_echo_moe_scheduler.py \
   tests/unit_tests/transformer/moe/test_eplb_moe_scheduler.py \
   tests/unit_tests/transformer/moe/test_moonep_moe_scheduler.py

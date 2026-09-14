@@ -107,7 +107,7 @@ def test_scheduler_factory_builds_eplb_planner():
     scheduler = MoEScheduler.from_config(
         SimpleNamespace(
             moe_scheduler_planner_type="eplb",
-            moe_scheduler_expert_dispatcher_type="replica_hybridep",
+            moe_scheduler_expert_dispatcher_type="replica_peer_tma",
             moe_scheduler_num_idle_experts=2,
             moe_scheduler_assignment_algorithm="approx_bin_packing",
             num_moe_experts=4,

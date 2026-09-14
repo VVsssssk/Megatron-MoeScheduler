@@ -14,9 +14,14 @@ import torch.distributed as dist
 
 from megatron.core.transformer.moe.replica_weight_transport import (
     ReplicaGradDestination,
+    ReplicaPreparedPlan,
+    ReplicaTransferHandle,
+    ReplicaTransportCapabilities,
     ReplicaTransportConfig,
+    ReplicaWeightLayout,
     ReplicaWeightSource,
     ReplicaWeightTransport,
+    register_replica_transport_finalizer,
 )
 from megatron.core.transformer.moe.replica_weight_triton import (
     MAX_REPLICA_WEIGHT_SMS,
@@ -44,11 +49,7 @@ class _PeerTmaWorkspace:
     """Fixed symmetric arenas shared by compatible MoE layers on one EP group."""
 
     def __init__(
-        self,
-        *,
-        group: dist.ProcessGroup,
-        device: torch.device,
-        config: _PeerTmaWorkspaceConfig,
+        self, *, group: dist.ProcessGroup, device: torch.device, config: _PeerTmaWorkspaceConfig
     ) -> None:
         import torch.distributed._symmetric_memory as symm_mem
 
@@ -253,16 +254,19 @@ class PeerTmaTransport(ReplicaWeightTransport):
     """Use symmetric peer mappings and Triton TMA within one NVLink domain."""
 
     transport_name = "peer_tma"
+    capabilities = ReplicaTransportCapabilities(
+        weight_formats=("bf16", "mxfp8"),
+        grad_dtypes=(torch.bfloat16, torch.float32),
+        device_plan=True,
+        cuda_graph=True,
+    )
 
     def __init__(self, config: ReplicaTransportConfig) -> None:
-        self.config = config
+        super().__init__(config)
         self.rank = dist.get_rank(group=config.group)
         self.workspace = _get_peer_tma_workspace(config)
+        register_replica_transport_finalizer("peer_tma", finalize_peer_tma_transports)
         self._destroyed = False
-        self._prefetch_done = torch.cuda.Event()
-        self._grad_reduce_done = (torch.cuda.Event(), torch.cuda.Event())
-        for event in (self._prefetch_done, *self._grad_reduce_done):
-            event.record(torch.cuda.current_stream(config.device))
 
     @property
     def grad_dtype(self) -> torch.dtype:
@@ -277,12 +281,19 @@ class PeerTmaTransport(ReplicaWeightTransport):
     @torch.no_grad()
     @nvtx_decorator(message="replica_weight_push_start")
     def start_weight_sync(
-        self,
-        *,
-        sources: tuple[ReplicaWeightSource, ...],
-        experts_to_copy: torch.Tensor,
-    ) -> torch.cuda.Event:
+        self, *, sources: tuple[ReplicaWeightSource, ...], plan: ReplicaPreparedPlan
+    ) -> ReplicaTransferHandle:
+        self.validate_plan(plan)
         workspace = self.workspace
+        expected_layouts = (
+            (ReplicaWeightLayout.PLAIN,)
+            if workspace.weight_format == "bf16"
+            else (ReplicaWeightLayout.ROWWISE, ReplicaWeightLayout.COLUMNWISE)
+        )
+        if len(sources) != 2 or any(source.layout not in expected_layouts for source in sources):
+            raise ValueError("Peer-TMA requires two projections with matching weight layouts.")
+        if sources[0].layout != sources[1].layout:
+            raise ValueError("Peer-TMA projections must use the same weight direction.")
         data_bases = tuple(source.data_bases for source in sources)
         if any(base is None for base in data_bases):
             raise ValueError("Peer-TMA transport requires device data pointer tables.")
@@ -292,6 +303,7 @@ class PeerTmaTransport(ReplicaWeightTransport):
         current_stream = torch.cuda.current_stream(self.config.device)
         weight_stream = workspace.select_weight_stream(current_stream)
         weight_stream.wait_stream(current_stream)
+        done = torch.cuda.Event()
         with torch.cuda.stream(weight_stream):
             launch_replica_weight_prefetch(
                 sources=data_bases,
@@ -299,7 +311,7 @@ class PeerTmaTransport(ReplicaWeightTransport):
                 arena=workspace.weight_arena,
                 peer_bases=workspace.weight_handle.buffer_ptrs_dev,
                 signal_bases=workspace.weight_handle.signal_pad_ptrs_dev,
-                experts_to_copy=experts_to_copy,
+                experts_to_copy=plan.placement.slot_to_expert,
                 grid_barrier=workspace.weight_grid_barrier,
                 rank=self.rank,
                 world_size=self.config.world_size,
@@ -308,13 +320,15 @@ class PeerTmaTransport(ReplicaWeightTransport):
                 member_numels=workspace.member_numels,
                 num_sms=workspace.num_sms,
             )
-            self._prefetch_done.record(weight_stream)
-        return self._prefetch_done
+            done.record(weight_stream)
+        return ReplicaTransferHandle(self, done, (plan, sources))
 
     @torch.no_grad()
     @nvtx_decorator(message="replica_weight_push_wait")
-    def wait_weight_sync(self, handle: torch.cuda.Event) -> None:
-        torch.cuda.current_stream(self.config.device).wait_event(handle)
+    def wait_weight_sync(self, handle: ReplicaTransferHandle) -> None:
+        if handle.transport is not self:
+            raise ValueError("Replica completion belongs to a different transport.")
+        torch.cuda.current_stream(self.config.device).wait_event(handle.completion)
 
     @torch.no_grad()
     @nvtx_decorator(message="replica_grad_reduce_start")
@@ -322,10 +336,11 @@ class PeerTmaTransport(ReplicaWeightTransport):
         self,
         *,
         native_grads: tuple[ReplicaGradDestination, ...],
-        experts_to_copy: torch.Tensor,
+        plan: ReplicaPreparedPlan,
         projections: tuple[int, ...],
-    ) -> torch.cuda.Event:
-        if len(projections) != 1:
+    ) -> ReplicaTransferHandle:
+        self.validate_plan(plan)
+        if len(projections) != 1 or projections[0] not in (0, 1):
             raise ValueError("Peer-TMA gradient reduction currently launches one projection.")
         native_grad_bases = tuple(destination.bases for destination in native_grads)
         if any(base is None for base in native_grad_bases):
@@ -334,13 +349,14 @@ class PeerTmaTransport(ReplicaWeightTransport):
         workspace = self.workspace
         current_stream = torch.cuda.current_stream(self.config.device)
         workspace.grad_stream.wait_stream(current_stream)
+        done = torch.cuda.Event()
         with torch.cuda.stream(workspace.grad_stream):
             launch_replica_grad_reduce(
                 arena=workspace.grad_arena,
                 native_grads=native_grad_bases,
                 peer_bases=workspace.grad_handle.buffer_ptrs_dev,
                 signal_bases=workspace.grad_handle.signal_pad_ptrs_dev,
-                experts_to_copy=experts_to_copy,
+                experts_to_copy=plan.placement.slot_to_expert,
                 grid_barrier=workspace.grad_grid_barrier,
                 rank=self.rank,
                 world_size=self.config.world_size,
@@ -350,20 +366,18 @@ class PeerTmaTransport(ReplicaWeightTransport):
                 num_sms=workspace.num_sms,
                 projections=projections,
             )
-            self._grad_reduce_done[projection].record(workspace.grad_stream)
-        return self._grad_reduce_done[projection]
+            done.record(workspace.grad_stream)
+        return ReplicaTransferHandle(self, done, (plan, native_grads))
 
     @torch.no_grad()
     @nvtx_decorator(message="replica_grad_reduce_wait")
-    def wait_grad_reduce(self, handle: torch.cuda.Event) -> None:
-        torch.cuda.current_stream(self.config.device).wait_event(handle)
+    def wait_grad_reduce(self, handle: ReplicaTransferHandle) -> None:
+        self.wait_weight_sync(handle)
 
     def destroy(self) -> None:
         """Drop layer-local completion objects while retaining the shared workspace."""
         if self._destroyed:
             return
-        self._prefetch_done = None
-        self._grad_reduce_done = ()
         self.workspace = None
         self._destroyed = True
 

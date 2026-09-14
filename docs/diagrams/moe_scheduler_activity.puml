@@ -41,7 +41,7 @@ if (MoEScheduler configured?) then (yes)
     :Validate physical_to_logical_map;
     :expert_dispatch.supports(map, context);
     if (Placement supported?) then (yes)
-      |ReplicaHybridEPExpertDispatch|
+      |ReplicaExpertDispatch|
       :dispatch(experts, map, context);
       :Acquire a stable plan slot;
       :Copy each rank's replica suffix into experts_to_copy;
@@ -49,13 +49,14 @@ if (MoEScheduler configured?) then (yes)
 
       |ReplicaExpertRuntime|
       :start_prefetch(plan, FORWARD);
+      :prepare_plan(placement) or reuse private scheduling metadata;
       :Prepare owner source weights;
 
       |PeerTmaTransport / weight stream|
       :start_weight_sync(...);
       :Launch asynchronous owner-to-replica weight copy;
       note right
-        The call returns a CUDA event immediately.
+        The call returns a transfer handle wrapping a CUDA event.
         No weight-transfer wait occurs in schedule().
       end note
 
@@ -177,7 +178,7 @@ if (Backward is executed for the planned forward?) then (yes)
   :Wait for FC1 and FC2 reduction events;
   |ReplicaExpertRuntime / backward|
   :Publish source-parameter gradients;
-  |ReplicaHybridEPExpertDispatch|
+  |ReplicaExpertDispatch|
   :Release the placement plan slot;
 else (no)
   :No scheduler backward lifecycle;

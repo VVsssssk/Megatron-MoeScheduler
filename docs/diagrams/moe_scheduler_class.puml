@@ -130,8 +130,8 @@ package "Planner implementations" {
 }
 
 package "Replica expert dispatch" {
-  class ReplicaHybridEPExpertDispatch {
-    {static} + dispatcher_name = "replica_hybridep"
+  class ReplicaExpertDispatch {
+    + dispatcher_name: str (configured transport type)
     - runtime: Optional[ReplicaExpertRuntime]
     - _active_plan: Optional[ReplicaPlan]
     - _plan_slots: list[_ReplicaPlanSlot]
@@ -147,6 +147,7 @@ package "Replica expert dispatch" {
   class ReplicaPlan <<value object>> {
     + virtual_experts: Tensor
     + experts_to_copy: Tensor
+    + version: int
   }
 
   class ReplicaExpertRuntime {
@@ -165,9 +166,11 @@ package "Replica expert dispatch" {
 
   abstract class ReplicaWeightTransport {
     {static} + transport_name: str
-    {abstract} + start_weight_sync(sources, experts_to_copy): Handle
+    + capabilities: ReplicaTransportCapabilities
+    + prepare_plan(placement): ReplicaPreparedPlan
+    {abstract} + start_weight_sync(sources, plan): ReplicaTransferHandle
     {abstract} + wait_weight_sync(handle)
-    {abstract} + start_grad_reduce(native_grads, experts_to_copy, projections): Handle
+    {abstract} + start_grad_reduce(native_grads, plan, projections): ReplicaTransferHandle
     {abstract} + wait_grad_reduce(handle)
     + destroy()
   }
@@ -175,12 +178,32 @@ package "Replica expert dispatch" {
   class PeerTmaTransport {
     {static} + transport_name = "peer_tma"
     - workspace: _PeerTmaWorkspace
-    + start_weight_sync(...): cuda.Event
-    + wait_weight_sync(event)
-    + start_grad_reduce(...): cuda.Event
-    + wait_grad_reduce(event)
+    + start_weight_sync(...): ReplicaTransferHandle
+    + wait_weight_sync(handle)
+    + start_grad_reduce(...): ReplicaTransferHandle
+    + wait_grad_reduce(handle)
   }
+  class HybridEPWeightTransport <<placeholder>>
+  class NcclP2PTransport <<placeholder>>
+  class ReplicaPreparedPlan {
+    + placement: ReplicaPlacement
+    + transport: ReplicaWeightTransport
+    + metadata: Any
+  }
+  class ReplicaPlacement {
+    + slot_to_expert: Tensor
+    + ownership: ReplicaOwnership
+    + version: int
+  }
+  class ReplicaOwnership
+  class ReplicaTransferHandle
 }
+
+ReplicaWeightTransport <|-- HybridEPWeightTransport
+ReplicaWeightTransport <|-- NcclP2PTransport
+ReplicaWeightTransport --> ReplicaPreparedPlan
+ReplicaPreparedPlan --> ReplicaPlacement
+ReplicaPlacement --> ReplicaOwnership
 
 MoELayer *-- "0..1" MoEScheduler
 MoELayer *-- "1" Experts
@@ -204,10 +227,10 @@ EPLBLoadPlanner ..> EPLBPlacementResult : creates / consumes
 MoonEPLoadPlanner ..> MoonEPPlacementResult : creates / consumes
 MoonEPPlacementResult o-- "0..1" ReplicaPlannerWorkspace
 
-ReplicaHybridEPExpertDispatch --|> ExpertDispatch
-ReplicaHybridEPExpertDispatch *-- "0..1" ReplicaExpertRuntime
-ReplicaHybridEPExpertDispatch ..> ReplicaPlan : creates per forward
-ReplicaHybridEPExpertDispatch ..> Experts : binds runtime
+ReplicaExpertDispatch --|> ExpertDispatch
+ReplicaExpertDispatch *-- "0..1" ReplicaExpertRuntime
+ReplicaExpertDispatch ..> ReplicaPlan : creates per forward
+ReplicaExpertDispatch ..> Experts : binds runtime
 ReplicaExpertRuntime --> ReplicaPlan : validates / executes
 ReplicaExpertRuntime *-- "1" ReplicaWeightTransport
 PeerTmaTransport --|> ReplicaWeightTransport
@@ -226,7 +249,7 @@ note bottom of MoEScheduler
   reroute() on the caller stream.
 end note
 
-note bottom of ReplicaHybridEPExpertDispatch
+note bottom of ReplicaExpertDispatch
   The public placement is rank-major E + R:
   [home expert slots][replica slots] per EP rank.
 end note

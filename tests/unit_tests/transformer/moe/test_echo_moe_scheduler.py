@@ -16,9 +16,7 @@ from megatron.core.transformer.moe.moe_scheduler import (
     SchedulerContext,
 )
 from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
-from megatron.core.transformer.moe.replica_hybridep_expert_dispatch import (
-    ReplicaHybridEPExpertDispatch,
-)
+from megatron.core.transformer.moe.replica_expert_dispatch import ReplicaExpertDispatch
 from megatron.core.transformer.moe.replica_weight_triton import _grad_arguments, _push_arguments
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -56,7 +54,7 @@ def _echo_context() -> SchedulerContext:
     )
 
 
-def _replica_dispatcher(num_idle_experts: int = 4) -> ReplicaHybridEPExpertDispatch:
+def _replica_dispatcher(num_idle_experts: int = 4) -> ReplicaExpertDispatch:
     class _Group:
         def size(self):
             return 2
@@ -68,11 +66,11 @@ def _replica_dispatcher(num_idle_experts: int = 4) -> ReplicaHybridEPExpertDispa
         num_moe_experts=4,
         expert_model_parallel_size=2,
         moe_scheduler_num_idle_experts=num_idle_experts,
-        moe_scheduler_expert_dispatcher_type="replica_hybridep",
+        moe_scheduler_expert_dispatcher_type="replica_peer_tma",
         grad_reduce_in_bf16=False,
         moe_flex_dispatcher_num_sms=None,
     )
-    return ReplicaHybridEPExpertDispatch(config=config, pg_collection=SimpleNamespace(ep=_Group()))
+    return ReplicaExpertDispatch(config=config, pg_collection=SimpleNamespace(ep=_Group()))
 
 
 def _hot_expert_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -111,7 +109,7 @@ def test_echo_planner_should_not_plan_without_idle_experts():
     )
 
 
-def test_replica_hybridep_dispatch_supports_configured_e_plus_r_layout():
+def test_replica_dispatch_supports_configured_e_plus_r_layout():
     context = _echo_context()
     dispatcher = _replica_dispatcher()
     smaller_dispatcher = _replica_dispatcher(num_idle_experts=2)
@@ -163,7 +161,7 @@ def test_echo_planner_requires_ep_group_for_multi_ep():
         )
 
 
-def test_replica_hybridep_dispatch_lowers_placement_to_runtime_plan():
+def test_replica_dispatch_lowers_placement_to_runtime_plan():
     context = _echo_context()
     physical_to_logical_map = torch.tensor([0, 1, 2, 2, 3, 0])
     dispatcher = _replica_dispatcher(num_idle_experts=2)
@@ -192,8 +190,8 @@ def test_replica_hybridep_dispatch_lowers_placement_to_runtime_plan():
     assert dispatcher._active_plan is None
 
 
-def test_replica_hybridep_dispatch_binds_transport_backed_runtime(monkeypatch):
-    from megatron.core.transformer.moe import replica_hybridep_expert_dispatch as replica_dispatch
+def test_replica_dispatch_binds_transport_backed_runtime(monkeypatch):
+    from megatron.core.transformer.moe import replica_expert_dispatch as replica_dispatch
 
     captured = {}
     runtime = object()
@@ -213,9 +211,7 @@ def test_replica_hybridep_dispatch_binds_transport_backed_runtime(monkeypatch):
             self.bound_runtime = value
 
     monkeypatch.setattr(replica_dispatch, "ReplicaExpertRuntime", fake_runtime)
-    monkeypatch.setattr(
-        replica_dispatch, "create_replica_weight_transport", fake_transport_factory
-    )
+    monkeypatch.setattr(replica_dispatch, "create_replica_weight_transport", fake_transport_factory)
     dispatcher = _replica_dispatcher()
     experts = _Experts()
     dispatcher.bind_experts(experts)
@@ -227,7 +223,7 @@ def test_replica_hybridep_dispatch_binds_transport_backed_runtime(monkeypatch):
     assert captured["num_local_replica_slots"] == 2
     transport_config = object()
     assert captured["transport_factory"](transport_config) is transport
-    assert captured["transport_dispatcher_type"] == "replica_hybridep"
+    assert captured["transport_dispatcher_type"] == "replica_peer_tma"
     assert captured["transport_config"] is transport_config
     assert captured["grad_dtype"] == torch.float32
 
@@ -242,12 +238,12 @@ def test_replica_transport_factory_uses_expert_dispatcher_type(monkeypatch):
     transport = object()
     monkeypatch.setattr(replica_peer_tma_transport, "PeerTmaTransport", lambda value: transport)
 
-    assert create_replica_weight_transport("replica_hybridep", config) is transport
+    assert create_replica_weight_transport("replica_peer_tma", config) is transport
     with pytest.raises(ValueError, match="Unsupported replica expert-dispatch transport"):
         create_replica_weight_transport("unsupported", config)
 
 
-def test_replica_hybridep_dispatch_preserves_runtime_backward_order():
+def test_replica_dispatch_preserves_runtime_backward_order():
     events = []
     parameter = torch.nn.Parameter(torch.ones(()))
 
@@ -338,7 +334,8 @@ def test_echo_scheduler_runs_planner_and_dispatch_adapter():
     assert output_probs.shape == output_routing_map.shape
 
 
-def test_moe_scheduler_builds_echo_planner_with_replica_dispatch():
+@pytest.mark.parametrize("backend", ["replica_peer_tma", "replica_hybridep", "replica_nccl"])
+def test_moe_scheduler_builds_echo_planner_with_replica_dispatch(backend):
     class _Group:
         def size(self):
             return 1
@@ -347,13 +344,16 @@ def test_moe_scheduler_builds_echo_planner_with_replica_dispatch():
             return 0
 
     scheduler = MoEScheduler.from_config(
-        _scheduler_config(moe_scheduler_num_idle_experts=2), SimpleNamespace(ep=_Group())
+        _scheduler_config(
+            moe_scheduler_num_idle_experts=2, moe_scheduler_expert_dispatcher_type=backend
+        ),
+        SimpleNamespace(ep=_Group()),
     )
 
     assert isinstance(scheduler.planner, EchoLoadPlanner)
     assert scheduler.planner.num_echo_experts == 2
-    assert isinstance(scheduler.expert_dispatch, ReplicaHybridEPExpertDispatch)
-    assert scheduler.expert_dispatch.dispatcher_name == "replica_hybridep"
+    assert isinstance(scheduler.expert_dispatch, ReplicaExpertDispatch)
+    assert scheduler.expert_dispatch.dispatcher_name == backend
 
 
 def test_moe_scheduler_builds_moonep_planner_with_replica_dispatch():
@@ -370,7 +370,7 @@ def test_moe_scheduler_builds_moonep_planner_with_replica_dispatch():
 
     assert isinstance(scheduler.planner, MoonEPLoadPlanner)
     assert scheduler.planner.num_redundant_experts == 4
-    assert isinstance(scheduler.expert_dispatch, ReplicaHybridEPExpertDispatch)
+    assert isinstance(scheduler.expert_dispatch, ReplicaExpertDispatch)
 
 
 def _scheduler_config(**overrides) -> TransformerConfig:
@@ -396,7 +396,7 @@ def _scheduler_config(**overrides) -> TransformerConfig:
         "moe_flex_dispatcher_backend": "hybridep",
         "moe_enable_scheduler": True,
         "moe_scheduler_num_idle_experts": 4,
-        "moe_scheduler_expert_dispatcher_type": "replica_hybridep",
+        "moe_scheduler_expert_dispatcher_type": "replica_peer_tma",
     }
     defaults.update(overrides)
     return TransformerConfig(**defaults)
@@ -408,7 +408,7 @@ def test_transformer_config_validates_moe_scheduler_requirements():
     assert config.moe_enable_scheduler
     assert config.grad_reduce_in_bf16 is False
     assert config.moe_scheduler_planner_type == "echo"
-    assert config.moe_scheduler_expert_dispatcher_type == "replica_hybridep"
+    assert config.moe_scheduler_expert_dispatcher_type == "replica_peer_tma"
 
     with pytest.raises(ValueError, match="moe_scheduler_num_idle_experts"):
         _scheduler_config(moe_scheduler_num_idle_experts=None)
@@ -418,7 +418,7 @@ def test_transformer_config_validates_moe_scheduler_requirements():
         _scheduler_config(add_bias_linear=True)
     with pytest.raises(ValueError, match="moe_scheduler_num_idle_experts to equal"):
         _scheduler_config(moe_scheduler_planner_type="moon_ep", moe_scheduler_num_idle_experts=2)
-    with pytest.raises(ValueError, match="Only.*replica_hybridep"):
+    with pytest.raises(ValueError, match="Unsupported moe_scheduler_expert_dispatcher_type"):
         _scheduler_config(moe_scheduler_expert_dispatcher_type="hybridep")
 
     replica_config = _scheduler_config(moe_scheduler_num_idle_experts=2)
