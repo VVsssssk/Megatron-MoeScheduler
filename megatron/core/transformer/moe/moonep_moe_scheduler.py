@@ -283,27 +283,18 @@ def _physical_to_logical_map_from_experts_to_copy(
 
     device = experts_to_copy.device
     num_local_home_experts = context.num_logical_experts // context.ep_size
-    num_local_physical_experts = 2 * num_local_home_experts
-    num_physical_experts = context.ep_size * num_local_physical_experts
-    physical_to_logical = torch.full((num_physical_experts,), -1, dtype=torch.long, device=device)
-
-    logical_ids = torch.arange(context.num_logical_experts, dtype=torch.long, device=device)
-    owner_ranks = torch.div(logical_ids, num_local_home_experts, rounding_mode="floor")
-    owner_slots = logical_ids.remainder(num_local_home_experts)
-    home_physical_ids = owner_ranks * num_local_physical_experts + owner_slots
-    physical_to_logical[home_physical_ids] = logical_ids
-
-    ranks = torch.arange(context.ep_size, dtype=torch.long, device=device)
-    replica_slots = torch.arange(num_local_home_experts, dtype=torch.long, device=device)
-    replica_physical_ids = (
-        ranks[:, None] * num_local_physical_experts
-        + num_local_home_experts
-        + replica_slots[None, :]
-    )
+    logical_ids = torch.arange(
+        context.num_logical_experts, dtype=torch.long, device=device
+    ).reshape(context.ep_size, num_local_home_experts)
     replica_logical_ids = experts_to_copy.to(dtype=torch.long)
     valid = (replica_logical_ids >= 0) & (replica_logical_ids < context.num_logical_experts)
-    physical_to_logical[replica_physical_ids[valid]] = replica_logical_ids[valid]
-    return physical_to_logical
+    # Keep every replica slot in the output, including inactive ones. Boolean
+    # indexing produces a dynamic-size tensor and synchronizes with the host,
+    # which is illegal during CUDA graph capture. Fixed-shape selection also
+    # lets graph replay handle a different active-slot mask each microbatch.
+    return torch.cat(
+        (logical_ids, torch.where(valid, replica_logical_ids, -1)), dim=1
+    ).reshape(-1)
 
 
 @dataclass(frozen=True, slots=True)

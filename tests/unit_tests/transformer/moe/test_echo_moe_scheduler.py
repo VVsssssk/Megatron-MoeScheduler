@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -447,14 +448,15 @@ def test_replica_scheduler_accepts_native_mxfp8_with_router_padding():
     assert config.moe_router_padding_for_quantization
 
 
-def test_nccl_replica_scheduler_rejects_mxfp8():
-    with pytest.raises(ValueError, match="replica_nccl.*BF16 weights only"):
-        _scheduler_config(
-            moe_scheduler_expert_dispatcher_type="replica_nccl",
-            fp8="e4m3",
-            fp8_recipe="mxfp8",
-            fp8_param=True,
-        )
+def test_nccl_replica_scheduler_accepts_mxfp8():
+    config = _scheduler_config(
+        moe_scheduler_expert_dispatcher_type="replica_nccl",
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        moe_router_padding_for_quantization=True,
+    )
+    assert config.fp8_recipe == "mxfp8"
 
 
 @pytest.mark.parametrize(
@@ -470,6 +472,28 @@ def test_nccl_replica_scheduler_rejects_moe_capture(impl, scopes):
         )
 
 
+@pytest.mark.parametrize("planner", ["echo", "moon_ep"])
+def test_replica_token_dispatcher_config_preserves_outer_moe_capture(planner):
+    config = _scheduler_config(
+        moe_scheduler_planner_type=planner,
+        moe_scheduler_num_idle_experts=4,
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=["attn", "moe"],
+    )
+    layer = SimpleNamespace(config=config, num_physical_experts=8)
+
+    dispatcher_config = MoELayer._get_token_dispatcher_config(layer)
+
+    assert dispatcher_config.num_moe_experts == 8
+    assert not dispatcher_config.moe_enable_scheduler
+    assert dispatcher_config.cuda_graph_impl == "none"
+    assert dispatcher_config.cuda_graph_modules == []
+    assert config.num_moe_experts == 4
+    assert config.moe_enable_scheduler
+    assert config.cuda_graph_impl == "transformer_engine"
+    assert [scope.name for scope in config.cuda_graph_modules] == ["attn", "moe"]
+
+
 def test_nccl_replica_scheduler_allows_attention_capture():
     config = _scheduler_config(
         moe_scheduler_expert_dispatcher_type="replica_nccl",
@@ -483,9 +507,17 @@ def test_nccl_replica_scheduler_allows_attention_capture():
     ("fp8", "fp8_recipe", "fp8_param"),
     [("e4m3", "mxfp8", False), ("e4m3", "tensorwise", True), ("hybrid", "mxfp8", True)],
 )
-def test_replica_scheduler_rejects_unsupported_fp8_parameter_storage(fp8, fp8_recipe, fp8_param):
+@pytest.mark.parametrize("backend", ["replica_peer_tma", "replica_nccl"])
+def test_replica_scheduler_rejects_unsupported_fp8_parameter_storage(
+    fp8, fp8_recipe, fp8_param, backend
+):
     with pytest.raises(ValueError, match="MXFP8 E4M3 with native FP8 parameters"):
-        _scheduler_config(fp8=fp8, fp8_recipe=fp8_recipe, fp8_param=fp8_param)
+        _scheduler_config(
+            fp8=fp8,
+            fp8_recipe=fp8_recipe,
+            fp8_param=fp8_param,
+            moe_scheduler_expert_dispatcher_type=backend,
+        )
 
 
 @pytest.mark.parametrize("scope", ["moe_router", "moe_preprocess"])
@@ -552,8 +584,10 @@ def test_moe_layer_scheduler_helper_uses_unified_scheduler_output():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize("backend", ["replica_peer_tma", "replica_nccl"])
-def test_moe_layer_auto_instantiates_scheduler_from_config(backend):
+@pytest.mark.parametrize(
+    "backend,mxfp8", [("replica_peer_tma", False), ("replica_nccl", False), ("replica_nccl", True)]
+)
+def test_moe_layer_auto_instantiates_scheduler_from_config(backend, mxfp8):
     Utils.initialize_model_parallel(1, 1)
     try:
         model_parallel_cuda_manual_seed(123)
@@ -561,6 +595,16 @@ def test_moe_layer_auto_instantiates_scheduler_from_config(backend):
             moe_scheduler_num_idle_experts=2,
             use_cpu_initialization=False,
             moe_scheduler_expert_dispatcher_type=backend,
+            **(
+                dict(
+                    fp8="e4m3",
+                    fp8_recipe="mxfp8",
+                    fp8_param=True,
+                    moe_router_padding_for_quantization=True,
+                )
+                if mxfp8
+                else {}
+            ),
         )
         # Replica runtime binding requires discrete TE grouped expert weights
         # and the operation fuser, matching the scheduler configuration.
@@ -571,7 +615,8 @@ def test_moe_layer_auto_instantiates_scheduler_from_config(backend):
         )
         assert isinstance(submodules, MoESubmodules)
 
-        layer = MoELayer(config, submodules)
+        with get_fp8_context(config, is_init=True):
+            layer = MoELayer(config, submodules)
 
         assert layer.num_logical_experts == 4
         assert layer.num_physical_experts == 6
@@ -585,5 +630,6 @@ def test_moe_layer_auto_instantiates_scheduler_from_config(backend):
         assert layer.idle_expert_indices == [4, 5]
         assert layer.experts.num_local_experts == 4
         assert layer.experts._replica_expert_runtime is not None
+        assert layer.experts._replica_expert_runtime.weight_format == ("mxfp8" if mxfp8 else "bf16")
     finally:
         Utils.destroy_model_parallel()

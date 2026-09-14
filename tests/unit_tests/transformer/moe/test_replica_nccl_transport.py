@@ -12,6 +12,7 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
+
 from megatron.core.transformer.moe.replica_nccl_transport import NcclP2PTransport, _compile_schedule
 from megatron.core.transformer.moe.replica_weight_transport import (
     ReplicaGradDestination,
@@ -23,7 +24,6 @@ from megatron.core.transformer.moe.replica_weight_transport import (
     ReplicaWeightSource,
     create_replica_weight_transport,
 )
-
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.launch_on_gb200
@@ -110,6 +110,110 @@ def ep_group(request, distributed_world):
         dist.barrier()
 
 
+@pytest.fixture(scope="module")
+def expert_tp_group(distributed_world):
+    group = None
+    for rank in range(dist.get_world_size()):
+        candidate = dist.new_group([rank], backend="nccl")
+        if rank == dist.get_rank():
+            group = candidate
+    yield group
+    dist.destroy_process_group(group)
+
+
+@pytest.mark.parametrize("swizzled", [False, True])
+def test_nccl_mxfp8_runtime_te_forward_and_dgrad(ep_group, expert_tp_group, swizzled, monkeypatch):
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.cpp_extensions import general_gemm
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear,
+        TERowParallelGroupedLinear,
+    )
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, TEGroupedMLP
+    from megatron.core.transformer.moe.replica_expert_runtime import (
+        ReplicaExpertRuntime,
+        ReplicaPlan,
+        _WeightDirection,
+    )
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+    quantizer.optimize_for_gemm = swizzled
+    rank, size = dist.get_rank(ep_group), dist.get_world_size(ep_group)
+    device = torch.device("cuda", torch.cuda.current_device())
+    shapes = ((512, 128), (128, 256))
+    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2 * size,
+        expert_model_parallel_size=size,
+        moe_ffn_hidden_size=256,
+        gated_linear_unit=True,
+        activation_func=torch.nn.functional.silu,
+        use_cpu_initialization=False,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        add_bias_linear=False,
+        moe_grouped_gemm=True,
+        use_transformer_engine_op_fuser=True,
+        gradient_accumulation_fusion=True,
+    )
+    experts = TEGroupedMLP(
+        num_local_experts=2,
+        config=config,
+        submodules=GroupedMLPSubmodules(
+            linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
+        ),
+        pg_collection=ProcessGroupCollection(ep=ep_group, expt_tp=expert_tp_group),
+    )
+    # Quantize deterministic native weights with real TE. The ordinary expert
+    # preparation hooks and runtime binding still run through TEGroupedMLP.
+    for linear, shape in zip((experts.linear_fc1, experts.linear_fc2), shapes):
+        for e in range(2):
+            linear.register_parameter(
+                f"weight{e}", torch.nn.Parameter(quantizer(_mx_dense(shape, 2 * rank + e, device)))
+            )
+    runtime = ReplicaExpertRuntime(
+        experts=experts,
+        group=ep_group,
+        num_experts=2 * size,
+        num_local_home_experts=2,
+        num_local_replica_slots=2,
+        transport_factory=NcclP2PTransport,
+    )
+    table = [[2 * ((r + 1) % size), 2 * ((r + 1) % size) + 1] for r in range(size)]
+    placements = torch.tensor(table, dtype=torch.int32, device=device)
+    plan = ReplicaPlan(
+        torch.cat((torch.arange(2 * size, device=device), placements.flatten())), placements
+    )
+    try:
+        assert runtime.weight_format == "mxfp8"
+        for direction in (_WeightDirection.FORWARD, _WeightDirection.BACKWARD):
+            runtime.start_prefetch(plan, direction)
+            runtime.wait_prefetch(plan)
+            for p, shape in enumerate(shapes):
+                for slot, expert in enumerate(table[rank]):
+                    actual_weight = runtime.projections[p].virtual_weight[slot]
+                    reference_weight = quantizer(_mx_dense(shape, expert, device))
+                    # Fprop uses rowwise weights; dgrad uses columnwise weights.
+                    backward = direction is _WeightDirection.BACKWARD
+                    width = shape[0] if backward else shape[1]
+                    inp = quantizer(_mx_dense((128, width), 0, device))
+                    kwargs = dict(
+                        out_dtype=torch.bfloat16, layout="NN" if backward else "TN", grad=backward
+                    )
+                    actual = general_gemm(actual_weight, inp, **kwargs)[0]
+                    expected = general_gemm(reference_weight, inp, **kwargs)[0]
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        runtime.destroy()
+
+
 def _config(group, dtype=torch.float32):
     return ReplicaTransportConfig(
         group=group,
@@ -144,6 +248,71 @@ def _placement(config, table, version=1):
     return ReplicaPlacement(
         torch.tensor(table, dtype=torch.int32, device=config.device), ReplicaOwnership(2), version
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_nccl_serialized_layers_share_native_staging_and_preserve_reductions(ep_group, dtype):
+    config = replace(_config(ep_group, dtype), share_native_grad_storage=True)
+    first = NcclP2PTransport(config)
+    second = NcclP2PTransport(config)
+    private = NcclP2PTransport(replace(config, share_native_grad_storage=False))
+    rank = dist.get_rank(ep_group)
+    table = _table(config.world_size, "mixed")
+    try:
+        for p in range(2):
+            assert first.native_projection_grad_view(p).data_ptr() == (
+                second.native_projection_grad_view(p).data_ptr()
+            )
+            assert first.native_projection_grad_view(p).data_ptr() != (
+                private.native_projection_grad_view(p).data_ptr()
+            )
+            assert first.projection_views(p)[1].data_ptr() != (
+                second.projection_views(p)[1].data_ptr()
+            )
+
+        # Alternate layers and producer streams. Each owner consumes the
+        # reduced gradient before the next layer reuses the shared staging.
+        for generation, transport in enumerate((first, second, first)):
+            plan = transport.prepare_plan(_placement(config, table, generation))
+            producer = torch.cuda.Stream()
+            producer.wait_stream(torch.cuda.current_stream())
+            base = 16 * (generation + 1)
+            with torch.cuda.stream(producer):
+                destinations = tuple(
+                    ReplicaGradDestination(tuple(transport.native_projection_grad_view(p)))
+                    for p in range(2)
+                )
+                for p in range(2):
+                    transport.native_projection_grad_view(p).fill_(base)
+                    transport.projection_views(p)[1].fill_(rank + generation + 1)
+                handle = transport.start_grad_reduce(
+                    native_grads=destinations, plan=plan, projections=(0, 1)
+                )
+            transport.wait_grad_reduce(handle)
+            for p in range(2):
+                for expert, actual in enumerate(destinations[p].tensors):
+                    expected = base + sum(
+                        source_rank + generation + 1
+                        for source_rank, row in enumerate(table)
+                        for logical in row
+                        if logical == rank * 2 + expert
+                    )
+                    torch.testing.assert_close(
+                        actual, torch.full_like(actual, expected), rtol=0, atol=0
+                    )
+
+        first.destroy()
+        second.native_projection_grad_view(0).fill_(7)
+        torch.testing.assert_close(
+            second.native_projection_grad_view(0),
+            torch.full_like(second.native_projection_grad_view(0), 7),
+            rtol=0,
+            atol=0,
+        )
+    finally:
+        first.destroy()
+        second.destroy()
+        private.destroy()
 
 
 def _weight(config, projection, expert, offset=0):
@@ -337,7 +506,7 @@ def test_nccl_dropped_handles_and_fp32_accumulation(ep_group):
 
 def test_nccl_validation_and_capture_with_prepared_plan(ep_group, monkeypatch):
     config = _config(ep_group)
-    with pytest.raises(ValueError, match="does not support mxfp8"):
+    with pytest.raises(ValueError, match="scale shapes"):
         NcclP2PTransport(replace(config, weight_format="mxfp8"))
     with pytest.raises(ValueError, match="indexed CUDA"):
         NcclP2PTransport(replace(config, device=torch.device("cpu")))
@@ -388,3 +557,186 @@ def test_nccl_validation_and_capture_with_prepared_plan(ep_group, monkeypatch):
         transport.destroy()
     with pytest.raises(RuntimeError, match="destroyed"):
         transport.projection_views(0)
+
+
+def _mx_config(group, dtype=torch.float32):
+    # Deliberately padded, unequal directional scale extents. The transport
+    # must carry the declared bytes rather than assuming weight_numel / 32.
+    return replace(
+        _config(group, dtype),
+        weight_format="mxfp8",
+        member_shapes=((32, 160), (160, 32)),
+        rowwise_scale_shapes=((128, 8), (256, 4)),
+        columnwise_scale_shapes=((4, 256), (8, 128)),
+    )
+
+
+def _mx_bytes(shape, expert, projection, component, generation, device):
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    return (
+        (
+            (
+                torch.arange(numel, device=device) * 17
+                + expert * 29
+                + projection * 37
+                + component * 53
+                + generation * 71
+            )
+            % 256
+        )
+        .to(torch.uint8)
+        .view(shape)
+    )
+
+
+def _mx_sources(config, rank, layout, generation):
+    columnwise = layout is ReplicaWeightLayout.COLUMNWISE
+    shapes = config.columnwise_scale_shapes if columnwise else config.rowwise_scale_shapes
+    return tuple(
+        ReplicaWeightSource(
+            data=tuple(
+                _mx_bytes(
+                    config.member_shapes[p],
+                    2 * rank + e,
+                    p,
+                    2 * columnwise,
+                    generation,
+                    config.device,
+                )
+                for e in range(2)
+            ),
+            scales=tuple(
+                _mx_bytes(shapes[p], 2 * rank + e, p, 2 * columnwise + 1, generation, config.device)
+                for e in range(2)
+            ),
+            layout=layout,
+        )
+        for p in range(2)
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("pattern", ["mixed", "local", "empty", "sparse"])
+def test_nccl_mxfp8_bytes_scales_and_gradients(ep_group, dtype, pattern):
+    config = _mx_config(ep_group, dtype)
+    rank = dist.get_rank(ep_group)
+    table = _table(config.world_size, pattern)
+    transport = NcclP2PTransport(config)
+    try:
+        plan = transport.prepare_plan(_placement(config, table))
+        views = [transport.projection_views(p) for p in range(2)]
+        pointers = [[tuple(t.data_ptr() for t in slot) for slot in weights] for weights, _ in views]
+        for weights, _ in views:
+            for slot in weights:
+                for tensor in slot:
+                    tensor.fill_(19)
+        # Reuse the plan with freshly allocated sources; preserve the other
+        # direction, including when switching back to forward after backward.
+        resident = {}
+        for generation, layout in enumerate(
+            (
+                ReplicaWeightLayout.ROWWISE,
+                ReplicaWeightLayout.COLUMNWISE,
+                ReplicaWeightLayout.ROWWISE,
+            )
+        ):
+            producer = torch.cuda.Stream()
+            producer.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(producer):
+                sources = _mx_sources(config, rank, layout, generation)
+                handle = transport.start_weight_sync(sources=sources, plan=plan)
+            direction = int(layout is ReplicaWeightLayout.COLUMNWISE)
+            resident[direction] = generation
+            for _ in range(2):
+                consumer = torch.cuda.Stream()
+                with torch.cuda.stream(consumer):
+                    transport.wait_weight_sync(handle)
+                    copies = [
+                        [tuple(t.clone() for t in slot) for slot in weights] for weights, _ in views
+                    ]
+                consumer.synchronize()
+                for p in range(2):
+                    for slot, expert in enumerate(table[rank]):
+                        for component, actual in enumerate(copies[p][slot]):
+                            direction = component // 2
+                            expected = (
+                                _mx_bytes(
+                                    actual.shape,
+                                    expert,
+                                    p,
+                                    component,
+                                    resident[direction],
+                                    config.device,
+                                )
+                                if expert >= 0 and direction in resident
+                                else torch.full_like(actual, 19)
+                            )
+                            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            transport.wait_weight_sync(handle)
+            del sources, handle
+        destinations = tuple(
+            ReplicaGradDestination(tuple(transport.native_projection_grad_view(p)))
+            for p in range(2)
+        )
+        expected = []
+        for p in range(2):
+            transport.native_projection_grad_view(p).fill_(256)
+            expected.append(
+                [torch.full(config.member_shapes[p], 256.0, device=config.device) for _ in range(2)]
+            )
+            for slot in range(4):
+                views[p][1][slot].copy_(_replica_grad(config, p, rank, slot))
+                if table[rank][slot] < 0:
+                    views[p][1][slot].fill_(float("nan"))
+            for source_rank, row in enumerate(table):
+                for slot, expert in enumerate(row):
+                    if expert >= 0 and expert // 2 == rank:
+                        expected[p][expert % 2].add_(
+                            _replica_grad(config, p, source_rank, slot).float()
+                        )
+        for p in (1, 0):
+            transport.start_grad_reduce(native_grads=destinations, plan=plan, projections=(p,))
+        assert pointers == [
+            [tuple(t.data_ptr() for t in slot) for slot in transport.projection_views(p)[0]]
+            for p in range(2)
+        ]
+        transport.destroy()  # Also verifies completion with discarded gradient handles.
+        for p in range(2):
+            for e in range(2):
+                torch.testing.assert_close(
+                    destinations[p].tensors[e], expected[p][e].to(dtype), rtol=0, atol=0
+                )
+    finally:
+        transport.destroy()
+
+
+def test_nccl_mxfp8_rejects_invalid_components(ep_group):
+    config = _mx_config(ep_group)
+    transport = NcclP2PTransport(config)
+    try:
+        plan = transport.prepare_plan(_placement(config, _table(config.world_size, "mixed")))
+        sources = _mx_sources(config, dist.get_rank(ep_group), ReplicaWeightLayout.ROWWISE, 0)
+        invalid = [
+            replace(sources[0], scales=None),
+            replace(sources[0], layout=ReplicaWeightLayout.PLAIN),
+            replace(sources[0], layout=ReplicaWeightLayout.COLUMNWISE),
+            replace(sources[0], scales=()),
+            replace(sources[0], scales=tuple(t.float() for t in sources[0].scales)),
+            replace(sources[0], scales=tuple(t.view(-1) for t in sources[0].scales)),
+            replace(sources[0], data=tuple(t.float() for t in sources[0].data)),
+        ]
+        for source in invalid:
+            with pytest.raises(ValueError):
+                transport.start_weight_sync(sources=(source, sources[1]), plan=plan)
+    finally:
+        transport.destroy()
+
+
+def _mx_dense(shape, expert, device):
+    rows = torch.arange(shape[0], device=device).view(-1, 1)
+    cols = torch.arange(shape[1], device=device).view(1, -1)
+    return (((rows * 11 + cols * 7 + expert * 3) % 37 - 18) / 16 * (1 + expert / 8)).to(
+        torch.bfloat16
+    )

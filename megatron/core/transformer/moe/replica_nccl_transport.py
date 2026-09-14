@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import weakref
 from dataclasses import dataclass
 
 import torch
@@ -73,8 +74,42 @@ def _compile_schedule(table: list[list[int]], home_experts: int, rank: int) -> _
     )
 
 
+class _NativeGradStorage:
+    """Native gradient staging, optionally shared by serialized layer runtimes."""
+
+    def __init__(self, config: ReplicaTransportConfig) -> None:
+        self.buffers = tuple(
+            torch.empty(
+                (config.num_local_home_experts, *shape),
+                dtype=config.grad_dtype,
+                device=config.device,
+            )
+            for shape in config.member_shapes
+        )
+
+
+_native_grad_storage: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+
+
+def _get_native_grad_storage(config: ReplicaTransportConfig) -> _NativeGradStorage:
+    if not config.share_native_grad_storage:
+        return _NativeGradStorage(config)
+    key = (
+        config.group,
+        config.device,
+        config.num_local_home_experts,
+        config.member_shapes,
+        config.grad_dtype,
+    )
+    storage = _native_grad_storage.get(key)
+    if storage is None:
+        storage = _NativeGradStorage(config)
+        _native_grad_storage[key] = storage
+    return storage
+
+
 class NcclP2PTransport(ReplicaWeightTransport):
-    """Transport BF16 expert storage over a borrowed NCCL EP process group.
+    """Transport BF16 or MXFP8 expert storage over a borrowed NCCL EP process group.
 
     Construction is collective over ``config.group`` and must occur in the
     same order on every member. A small all-reduce initializes the group before
@@ -84,14 +119,15 @@ class NcclP2PTransport(ReplicaWeightTransport):
 
     Planning synchronously copies the slot table to the host once per plan.
     Dynamic host schedules are not CUDA-graph safe, including when prepared
-    before capture. Storage and one communication stream are layer-local.
+    before capture. Replica storage and one communication stream are layer-local.
+    Serialized runtimes may opt into shared native-gradient staging.
     Callers must finish consumers before overwriting reusable replica storage.
     ``num_sms`` is not a portable NCCL P2P launch control and is unused here.
     """
 
     transport_name = "replica_nccl"
     capabilities = ReplicaTransportCapabilities(
-        weight_formats=("bf16",), grad_dtypes=(torch.bfloat16, torch.float32)
+        weight_formats=("bf16", "mxfp8"), grad_dtypes=(torch.bfloat16, torch.float32)
     )
 
     def __init__(self, config: ReplicaTransportConfig) -> None:
@@ -111,6 +147,15 @@ class NcclP2PTransport(ReplicaWeightTransport):
             or any(len(shape) != 2 or min(shape) <= 0 for shape in config.member_shapes)
         ):
             raise ValueError("replica_nccl requires valid expert counts and two matrix shapes.")
+        self._mxfp8 = config.weight_format == "mxfp8"
+        if self._mxfp8:
+            for shapes in (config.rowwise_scale_shapes, config.columnwise_scale_shapes):
+                if (
+                    shapes is None
+                    or len(shapes) != 2
+                    or any(not shape or any(dim <= 0 for dim in shape) for shape in shapes)
+                ):
+                    raise ValueError("replica_nccl MXFP8 requires both projections' scale shapes.")
         self._destroyed = False
         self._check_available()
         self.rank = dist.get_rank(config.group)
@@ -120,21 +165,36 @@ class NcclP2PTransport(ReplicaWeightTransport):
         self._numels = tuple(math.prod(shape) for shape in config.member_shapes)
         self._weights = tuple(
             torch.empty(
-                (config.num_local_replica_slots, *shape), dtype=torch.bfloat16, device=config.device
-            )
-            for shape in config.member_shapes
-        )
-        self._replica_grads = tuple(
-            torch.empty_like(weight, dtype=config.grad_dtype) for weight in self._weights
-        )
-        self._native_grads = tuple(
-            torch.empty(
-                (config.num_local_home_experts, *shape),
-                dtype=config.grad_dtype,
+                (config.num_local_replica_slots, *shape),
+                dtype=torch.uint8 if self._mxfp8 else torch.bfloat16,
                 device=config.device,
             )
             for shape in config.member_shapes
         )
+        # Directions have independent stable storage: backward columnwise copies
+        # must not overwrite forward rowwise data or differently padded scales.
+        self._columnwise_weights = (
+            tuple(torch.empty_like(weight) for weight in self._weights) if self._mxfp8 else ()
+        )
+        self._scales = {}
+        if self._mxfp8:
+            for layout, shapes in (
+                (ReplicaWeightLayout.ROWWISE, config.rowwise_scale_shapes),
+                (ReplicaWeightLayout.COLUMNWISE, config.columnwise_scale_shapes),
+            ):
+                self._scales[layout] = tuple(
+                    torch.empty(
+                        (config.num_local_replica_slots, *shape),
+                        dtype=torch.uint8,
+                        device=config.device,
+                    )
+                    for shape in shapes
+                )
+        self._replica_grads = tuple(
+            torch.empty_like(weight, dtype=config.grad_dtype) for weight in self._weights
+        )
+        self._native_grad_storage = _get_native_grad_storage(config)
+        self._native_grads = self._native_grad_storage.buffers
         self._stream = torch.cuda.Stream(device=config.device)
         self._inflight: list[tuple[torch.cuda.Event, tuple]] = []
         # All members participate even when this layer's eventual plan has no
@@ -163,9 +223,21 @@ class NcclP2PTransport(ReplicaWeightTransport):
 
     def projection_views(
         self, projection_index: int
-    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-        """Return stable BF16 replica weight views and gradient storage."""
+    ) -> tuple[tuple[torch.Tensor | tuple[torch.Tensor, ...], ...], torch.Tensor]:
+        """Return stable BF16 weights or MXFP8 row/column data and scale views."""
         self._projection_index(projection_index)
+        if self._mxfp8:
+            return (
+                tuple(
+                    zip(
+                        self._weights[projection_index],
+                        self._scales[ReplicaWeightLayout.ROWWISE][projection_index],
+                        self._columnwise_weights[projection_index],
+                        self._scales[ReplicaWeightLayout.COLUMNWISE][projection_index],
+                    )
+                ),
+                self._replica_grads[projection_index],
+            )
         return tuple(self._weights[projection_index]), self._replica_grads[projection_index]
 
     def native_projection_grad_view(self, projection_index: int) -> torch.Tensor:
@@ -191,14 +263,16 @@ class NcclP2PTransport(ReplicaWeightTransport):
         self._inflight = [(event, refs) for event, refs in self._inflight if not event.query()]
         return plan.metadata
 
-    def _validate_tensors(self, tensors, projection: int, dtype: torch.dtype) -> None:
+    def _validate_tensors(self, tensors, projection: int, dtype: torch.dtype, shape=None) -> None:
         if len(tensors) != self.config.num_local_home_experts:
             raise ValueError("Replica tensors must contain every canonical local expert.")
         for tensor in tensors:
             if (
                 tensor.device != self.config.device
                 or tensor.dtype != dtype
-                or tensor.numel() != self._numels[projection]
+                or tensor.numel()
+                != (math.prod(shape) if shape is not None else self._numels[projection])
+                or (shape is not None and tuple(tensor.shape) != tuple(shape))
                 or not tensor.is_contiguous()
             ):
                 raise ValueError("Replica tensor device, dtype, size or contiguity is invalid.")
@@ -243,22 +317,45 @@ class NcclP2PTransport(ReplicaWeightTransport):
         schedule = self._schedule(plan)
         if len(sources) != 2:
             raise ValueError("replica_nccl requires FC1 and FC2 weight sources.")
+        dtype = torch.uint8 if self._mxfp8 else torch.bfloat16
+        parts = []
+        layout = sources[0].layout
         for projection, source in enumerate(sources):
-            if source.layout is not ReplicaWeightLayout.PLAIN or source.scales is not None:
-                raise ValueError("replica_nccl supports plain BF16 weights without scales.")
-            self._validate_tensors(source.data, projection, torch.bfloat16)
+            if self._mxfp8:
+                if (
+                    layout not in (ReplicaWeightLayout.ROWWISE, ReplicaWeightLayout.COLUMNWISE)
+                    or source.layout is not layout
+                    or source.scales is None
+                ):
+                    raise ValueError(
+                        "replica_nccl MXFP8 requires matching directional data and scales."
+                    )
+                weights = (
+                    self._columnwise_weights
+                    if layout is ReplicaWeightLayout.COLUMNWISE
+                    else self._weights
+                )
+                scales = self._scales[layout][projection]
+                self._validate_tensors(source.scales, projection, torch.uint8, scales.shape[1:])
+            else:
+                if source.layout is not ReplicaWeightLayout.PLAIN or source.scales is not None:
+                    raise ValueError("replica_nccl supports plain BF16 weights without scales.")
+                weights = self._weights
+            self._validate_tensors(source.data, projection, dtype)
+            parts.append((source.data, weights[projection], self._numels[projection]))
+            if self._mxfp8:
+                parts.append((source.scales, scales, math.prod(scales.shape[1:])))
         self._stream.wait_stream(torch.cuda.current_stream(self.config.device))
         with torch.cuda.stream(self._stream):
-            for source in sources:
-                for tensor in source.data:
+            for tensors, storage, _ in parts:
+                for tensor in tensors:
                     tensor.record_stream(self._stream)
-            for weights in self._weights:
-                weights.record_stream(self._stream)
+                storage.record_stream(self._stream)
             sends = {
                 route.peer: torch.cat(
                     [
-                        source.data[index].view(-1)
-                        for source in sources
+                        tensor_set[index].view(-1)
+                        for tensor_set, _, _ in parts
                         for index in route.home_indices
                     ]
                 )
@@ -267,21 +364,19 @@ class NcclP2PTransport(ReplicaWeightTransport):
             receives, buffers = self._exchange(
                 sends,
                 {
-                    route.peer: len(route.replica_slots) * sum(self._numels)
+                    route.peer: len(route.replica_slots) * sum(part[2] for part in parts)
                     for route in schedule.receives
                 },
-                torch.bfloat16,
+                dtype,
             )
-            for projection, source in enumerate(sources):
+            for tensors, storage, _ in parts:
                 for index, slot in zip(schedule.local.home_indices, schedule.local.replica_slots):
-                    self._weights[projection][slot].view(-1).copy_(source.data[index].view(-1))
+                    storage[slot].view(-1).copy_(tensors[index].view(-1))
             for route in schedule.receives:
                 offset = 0
-                for projection, numel in enumerate(self._numels):
+                for _, storage, numel in parts:
                     for slot in route.replica_slots:
-                        self._weights[projection][slot].view(-1).copy_(
-                            receives[route.peer].narrow(0, offset, numel)
-                        )
+                        storage[slot].view(-1).copy_(receives[route.peer].narrow(0, offset, numel))
                         offset += numel
             return self._finish(plan, sources, buffers)
 
@@ -376,5 +471,7 @@ class NcclP2PTransport(ReplicaWeightTransport):
         self._check_available()
         self._stream.synchronize()
         self._inflight.clear()
-        self._weights = self._replica_grads = self._native_grads = ()
+        self._weights = self._columnwise_weights = self._replica_grads = self._native_grads = ()
+        self._native_grad_storage = None
+        self._scales.clear()
         self._destroyed = True

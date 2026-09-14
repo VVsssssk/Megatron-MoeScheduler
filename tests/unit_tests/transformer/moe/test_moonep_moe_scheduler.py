@@ -143,6 +143,30 @@ def test_moonep_planner_rejects_removed_count_matrix_adapter():
         MoonEPLoadPlanner(num_redundant_experts=2).plan_with_count_matrix()
 
 
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_moonep_physical_layout_graph_replays_changed_replica_mask():
+    context = _context(ep_size=2, ep_rank=1)
+    replicas = torch.full((2, 2), -1, dtype=torch.int32, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _physical_to_logical_map_from_experts_to_copy(replicas, context)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        layout = _physical_to_logical_map_from_experts_to_copy(replicas, context)
+
+    for values, expected in [
+        ([[-1, -1], [0, 1]], [0, 1, -1, -1, 2, 3, 0, 1]),
+        ([[3, 2], [-1, 4]], [0, 1, 3, 2, 2, 3, -1, -1]),
+        ([[-7, -1], [-1, -1]], [0, 1, -1, -1, 2, 3, -1, -1]),
+    ]:
+        replicas.copy_(torch.tensor(values, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        assert layout.tolist() == expected
+
+
 def test_moonep_extracts_compact_routes_from_common_dense_ir():
     topk_ids = torch.tensor([[3, 0], [2, 1]])
     probs, routing_map, _ = _route_inputs(topk_ids, num_experts=4)

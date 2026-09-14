@@ -953,7 +953,7 @@ class TransformerConfig(ModelParallelConfig):
 
     The single replica expert dispatcher uses this value to select its weight transport.
     ``replica_peer_tma`` selects the existing symmetric-memory peer-TMA transport.
-    ``replica_nccl`` selects packed NCCL P2P for BF16 weights with host planning.
+    ``replica_nccl`` selects packed NCCL P2P for BF16/MXFP8 weights with host planning.
     ``replica_hybridep`` is a reserved, unimplemented transport.
     Existing configs using the old ``replica_hybridep`` name must use ``replica_peer_tma``.
     """
@@ -2133,8 +2133,6 @@ class TransformerConfig(ModelParallelConfig):
             replica_mxfp8 = (
                 self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
             )
-            if self.moe_scheduler_expert_dispatcher_type == "replica_nccl" and self.fp8:
-                raise ValueError("replica_nccl currently supports BF16 weights only.")
             required_values = {
                 "moe_token_dispatcher_type": "flex",
                 "moe_flex_dispatcher_backend": "hybridep",

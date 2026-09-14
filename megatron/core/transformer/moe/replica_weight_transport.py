@@ -112,6 +112,12 @@ class ReplicaTransportConfig:
     columnwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None
     grad_dtype: torch.dtype
     num_sms: int | None
+    share_native_grad_storage: bool = False
+    """Reuse native wgrad staging across serialized layer runtimes on this group.
+
+    The caller must finish gradient reduction and consume its results before
+    another layer writes staging. Standalone transports keep private storage.
+    """
 
 
 @dataclass(frozen=True, slots=True)

@@ -544,6 +544,10 @@ class ReplicaExpertRuntime:
             ),
             grad_dtype=grad_dtype,
             num_sms=num_sms,
+            # The layer-input backward boundary finishes transport reduction
+            # and hands wgrads to their owner before the preceding layer runs.
+            # Peer-TMA already uses shared staging under this same lifecycle.
+            share_native_grad_storage=True,
         )
         self.transport: ReplicaWeightTransport = transport_factory(transport_config)
 

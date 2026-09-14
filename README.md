@@ -211,7 +211,7 @@ The same architecture is available as standalone PlantUML sources:
 | Planner | `moon_ep` | `MoonEPLoadPlanner` | PR #6892 fused per-step placement: one cooperative kernel with symmetric-memory histogram exchange. |
 | Expert dispatch | `replica_peer_tma` | `ReplicaExpertDispatch` | One replica lifecycle implementation; the type currently selects `PeerTmaTransport`. |
 | Expert dispatch | `replica_hybridep` | Same dispatcher, `HybridEPWeightTransport` | Placeholder; raises `NotImplementedError` before transport allocation. |
-| Expert dispatch | `replica_nccl` | Same dispatcher, `NcclP2PTransport` | Packed NCCL P2P; BF16 weights, BF16/FP32 gradients, host planning. |
+| Expert dispatch | `replica_nccl` | Same dispatcher, `NcclP2PTransport` | Packed NCCL P2P; BF16/MXFP8 weights, BF16/FP32 gradients, host planning. |
 
 UltraEP is a planned integration. It should implement the same common planner
 output or expert-dispatch input semantics instead of exposing UltraEP-native
@@ -260,10 +260,11 @@ name or compatibility alias. The HybridEP placeholder is accepted by
 configuration validation but cannot execute or bind weights.
 
 Set `moe_scheduler_expert_dispatcher_type: replica_nccl` to use packed NCCL
-P2P with BF16 weights and BF16 or FP32 gradient storage. It requires an
+P2P with BF16 or native MXFP8 weights and BF16 or FP32 gradient storage. It requires an
 initialized NCCL EP group and the current CUDA device to match the runtime
-device. Construction is collective across that group. MXFP8 and CUDA graph
-capture including MoE are rejected; attention-only graphs remain supported.
+device. Construction is collective across that group. CUDA graph capture
+including MoE is rejected; attention-only graphs remain supported. MXFP8
+requires `fp8: e4m3`, `fp8_recipe: mxfp8`, and `fp8_param: true`.
 
 For MoonEP, set `moe_scheduler_planner_type: moon_ep`. The current MoonEP
 implementation allocates one replica slot for every home expert, so
@@ -280,7 +281,7 @@ All planners use the transport-backed `ReplicaExpertRuntime`. It supports an
 `E + R` runtime layout, where `R` is positive and divisible by the EP size.
 Every rank owns `E / EP` native experts followed by `R / EP` replica slots. It
 requires the HybridEP flex token dispatcher, BF16 execution, TE grouped GEMM
-with the operation fuser, and fused gradient accumulation. With Peer-TMA, weights may be BF16
+with the operation fuser, and fused gradient accumulation. With Peer-TMA or NCCL, weights may be BF16
 or native-parameter MXFP8 E4M3; FP4 and other FP8 recipes are rejected. The
 current `replica_peer_tma` type selects `PeerTmaTransport`, which requires a
 single NVLink domain and a PyTorch/NCCL build with working native NCCL
@@ -305,6 +306,12 @@ Current constraints:
 - CUDA graph capture is supported only at the whole-MoE scope for
   `replica_peer_tma`; separate `moe_router` and `moe_preprocess` scopes are
   rejected. MoE activation recompute is also rejected for this lifecycle.
+  The physical-expert token-dispatcher config does not own graph capture;
+  it clears its layer-level graph policy while the enclosing logical MoE
+  layer retains the requested capture scopes. Dispatcher kernels execute
+  within that enclosing graph. MoonEP converts replica placement to the common
+  physical layout with fixed-shape selection, so changing inactive replica slots
+  on graph replay never requires dynamic-size boolean indexing.
 - When GTP exposes #6892's non-consuming peek protocol, the weight push peeks
   at gathered weights and the expert GEMMs perform the real consume. Older GTP
   implementations retain the pre-existing consume-at-push compatibility path.
@@ -392,7 +399,7 @@ uses symmetric-memory histogram exchange.
 
 ## NCCL P2P Transport Design
 
-The initial NCCL backend supports plain BF16 weights and either BF16 or FP32
+The NCCL backend supports plain BF16 or MXFP8 weights and either BF16 or FP32
 replica/native gradient storage. It does not import Peer-TMA, Triton, or
 symmetric-memory helpers. TE parameter wrappers, GTP materialization, backward
 weight selection and optimizer handoff remain in `ReplicaExpertRuntime`.
@@ -412,13 +419,35 @@ consistent directed-edge ordering. Local replicas use device copies. The
 receiver unpacks into stable, layer-local replica storage. Duplicate experts
 in distinct slots are currently sent separately; unused slots are untouched.
 
+MXFP8 sends raw quantized data and E8M0 scale bytes together in one uint8
+message per peer. The wire order is FC1 data, FC1 scales, FC2 data, FC2 scales,
+with each component in destination-slot order. Scale extents come from the
+runtime's directional metadata, including TE padding; no fixed scale-to-data
+size ratio is assumed. Rowwise and columnwise data/scales have separate stable
+storage, returned in the TE wrapper contract's four-component order. A forward
+push updates only rowwise storage, and a backward push only columnwise storage.
+No quantization, dequantization, transpose, or scale swizzle occurs in transport;
+the runtime retains TE's dtype, quantizer, and scale-layout metadata. This uses
+more replica weight memory than the Peer-TMA direction-aliasing arena.
+
 Gradients follow the same routes in reverse, only for the requested
 projections. The owner adds local and received replica gradients to the
 existing native gradient in FP32, then casts once into the supplied native
 gradient destinations. Unreferenced native experts remain untouched. FC2 and
 FC1 can start separately, preserving the runtime's FC2-first backward order.
 
-Each layer owns its storage and one communication stream. A start waits for
+Replica weights/gradients and the communication stream remain layer-local.
+Native-gradient staging is private by default. `ReplicaExpertRuntime` opts into
+`share_native_grad_storage`: compatible serialized layers reuse one staging
+allocation per EP group, device, native-expert count, matrix shapes, and dtype.
+The runtime finishes reduction and consumes/forwards the result at its
+layer-input backward boundary before another layer writes staging, matching
+Peer-TMA's existing shared-staging lifecycle. A weak cache releases the pool
+after its last transport is destroyed. This avoids retaining a full extra
+expert-gradient copy for every layer. Independent callers must leave sharing
+disabled unless they provide the same consumer ordering.
+
+A start waits for
 its producer stream, packs messages, submits batched P2P, waits on NCCL Work
 objects on the communication stream, and enqueues unpack or accumulation.
 The returned event covers all of that work. Every wait inserts an event wait
@@ -442,8 +471,8 @@ Both plan preparation and operation starts reject CUDA capture, even for
 plans prepared before capture. `num_sms` is unused because the backend does
 not expose a portable per-operation NCCL SM limit. Future optimizations can
 add peer-local deduplication, reusable staging pools, and fused pack/reduce
-kernels after measuring the baseline. MXFP8 data/scale transfer and static
-CUDA-graph schedules require separate implementations and validation.
+kernels after measuring the baseline. Static CUDA-graph schedules require a
+separate implementation and validation.
 
 ## Extending MoE Scheduler
 

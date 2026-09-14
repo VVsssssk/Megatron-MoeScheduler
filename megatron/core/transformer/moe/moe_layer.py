@@ -437,6 +437,13 @@ class MoELayer(BaseMoELayer):
             self.config,
             num_moe_experts=self.num_physical_experts,
             moe_enable_scheduler=False,
+            # The enclosing layer owns graph capture. This physical-layout
+            # config constructs only the token dispatcher, not another MoE
+            # layer or graph. Retaining the logical layer's capture policy
+            # would incorrectly validate it as a standalone, scheduler-free
+            # dropless MoE. Dispatcher kernels still run in the outer graph.
+            cuda_graph_impl="none",
+            cuda_graph_modules=[],
         )
 
     def _build_moe_scheduler(
