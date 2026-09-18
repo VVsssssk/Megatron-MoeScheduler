@@ -2401,14 +2401,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 return grouped_splits[gemm_idx]
 
             checkpoint_num_gemms = self.num_gemms
-            if getattr(self.config, "moe_enable_scheduler", False):
-                num_idle_experts = getattr(self.config, "moe_scheduler_num_idle_experts", None) or 0
-                ep_size = get_pg_size(self._pg_collection.ep)
-                if num_idle_experts % ep_size != 0:
-                    raise ValueError("moe_scheduler_num_idle_experts must be divisible by EP size.")
-                checkpoint_num_gemms -= num_idle_experts // ep_size
-                if checkpoint_num_gemms <= 0:
-                    raise ValueError("MoEScheduler checkpoint expert count must be positive.")
+            # Registered grouped-linear parameters contain only physical home
+            # slots. Replica GEMMs live in ReplicaExpertRuntime and never enter
+            # this state dict, so subtracting replica capacity loses home shards.
 
             num_global_experts = get_pg_size(self._pg_collection.ep) * checkpoint_num_gemms
             local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * checkpoint_num_gemms
