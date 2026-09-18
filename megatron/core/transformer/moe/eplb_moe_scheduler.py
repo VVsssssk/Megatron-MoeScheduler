@@ -15,6 +15,7 @@ committed homes and transient replicas using a global EP token ordinal.
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
 from typing import Optional
 
@@ -196,7 +197,14 @@ class EPLBLoadPlanner(MoELoadPlanner):
 
     planner_name = "eplb"
 
-    def __init__(self, num_redundant_experts: int, home_update_interval: int = 0) -> None:
+    def __init__(
+        self,
+        num_redundant_experts: int,
+        home_update_interval: int = 0,
+        *,
+        num_logical_experts: Optional[int] = None,
+        pg_collection=None,
+    ) -> None:
         super().__init__()
         if num_redundant_experts < 0:
             raise ValueError("num_redundant_experts must be non-negative.")
@@ -204,6 +212,9 @@ class EPLBLoadPlanner(MoELoadPlanner):
         if home_update_interval < 0:
             raise ValueError("home_update_interval must be non-negative.")
         self.home_update_interval = home_update_interval
+        self.num_logical_experts = num_logical_experts
+        self.pg_collection = pg_collection
+        self._restore_pending = False
         self.register_buffer(
             "active_home_layout", torch.empty(0, dtype=torch.int64), persistent=False
         )
@@ -223,52 +234,189 @@ class EPLBLoadPlanner(MoELoadPlanner):
         if completed_version is not None:
             if completed_version != self._pending_version:
                 raise RuntimeError("EPLB received a stale or unknown home completion.")
-            self.active_home_layout.copy_(self._pending_home_layout)
+            self.active_home_layout.copy_(
+                self._pending_home_layout.to(self.active_home_layout.device)
+            )
             self._pending_home_layout = None
             self._pending_version = None
         elif self._pending_version is not None:
             raise RuntimeError("EPLB cannot commit a pending layout without home completion.")
         if self._pending_replica_layout is not None:
-            self.active_replica_layout.copy_(self._pending_replica_layout)
+            self.active_replica_layout.copy_(
+                self._pending_replica_layout.to(self.active_replica_layout.device)
+            )
             self._pending_replica_layout = None
         self._steps += 1
 
+    def _checkpoint_topology(self):
+        groups = self.pg_collection
+        sizes = {
+            name: getattr(groups, name).size()
+            for name in ("ep", "tp", "dp_cp")
+            if getattr(groups, name, None) is not None
+        }
+        return dict(
+            sizes,
+            num_logical_experts=self.num_logical_experts,
+            num_redundant_experts=self.num_redundant_experts,
+        )
+
+    def _checkpoint_rank(self):
+        # Load history is EP-reduced, but differs across data replicas and may
+        # differ across TP ranks. Preserve each owner, rather than deduplicating.
+        return (
+            "_".join(
+                f"{name}{getattr(self.pg_collection, name).rank()}"
+                for name in ("tp", "dp_cp")
+                if getattr(self.pg_collection, name, None) is not None
+            )
+            or "local"
+        )
+
     def get_extra_state(self):
-        """Layout metadata saved with physical parameter slots at a step boundary."""
+        """Snapshot logical ownership and deferred plans without aliasing live buffers."""
+
+        def snapshot(value):
+            return None if value is None else value.detach().cpu().clone()
+
         return {
-            "home_layout": self.active_home_layout.detach().cpu(),
-            "replica_layout": self.active_replica_layout.detach().cpu(),
+            "schema_version": 1,
+            "topology": self._checkpoint_topology(),
+            "home_update_interval": self.home_update_interval,
+            "home_layout": snapshot(self.active_home_layout),
+            "replica_layout": snapshot(self.active_replica_layout),
             "steps": self._steps,
             "version": self._version,
             "last_proposal_step": self._last_proposal_step,
-            "load_history": self._load_history.detach().cpu(),
+            "load_history": snapshot(self._load_history),
+            "pending_home_layout": snapshot(self._pending_home_layout),
+            "pending_replica_layout": snapshot(self._pending_replica_layout),
+            "pending_version": self._pending_version,
         }
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         super()._save_to_state_dict(destination, prefix, keep_vars)
-        if not self.home_update_interval:
-            destination.pop(prefix + "_extra_state", None)
+        destination.pop(prefix + "_extra_state", None)
+        if self.home_update_interval:
+            # FSDP deliberately discards TE _extra_state. Planner state is a
+            # separate field, and opaque bytes allow DCP to load variable-sized
+            # layouts into a freshly constructed (empty) planner.
+            stream = io.BytesIO()
+            torch.save(self.get_extra_state(), stream)
+            destination[prefix + "_planner_state"] = {self._checkpoint_rank(): stream.getvalue()}
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Keep rank-local planning history in both MCore and native DCP formats."""
+        from megatron.core.dist_checkpointing.mapping import ShardedObject
+
+        state = self.state_dict()
+        if not state:
+            return {}
+        offsets = list(sorted(sharded_offsets))
+        if [axis for axis, _, _ in offsets] != list(range(len(offsets))):
+            raise ValueError("Planner checkpoint offsets must be contiguous.")
+        shape = tuple(size for _, _, size in offsets)
+        offset = tuple(rank for _, rank, _ in offsets)
+        for name in ("tp", "dp_cp"):
+            group = getattr(self.pg_collection, name, None)
+            shape += (1 if group is None else group.size(),)
+            offset += (0 if group is None else group.rank(),)
+        key = prefix + "_planner_state"
+        return {key: ShardedObject(key, state["_planner_state"], shape, offset, replica_id=0)}
 
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
     ):
+        key = prefix + "_planner_state"
+        extra_key = prefix + "_extra_state"
+        if self.home_update_interval:
+            if key not in state_dict:
+                # Generic training loaders sometimes retry with strict=False.
+                # Missing ownership can silently train the wrong logical model.
+                raise RuntimeError(f"Missing required MoEScheduler checkpoint state: {key}")
+            packed = state_dict.pop(key)
+            rank = self._checkpoint_rank()
+            if rank not in packed:
+                raise ValueError("MoEScheduler checkpoint has a different rank topology.")
+            state_dict[extra_key] = torch.load(
+                io.BytesIO(packed[rank]), map_location="cpu", weights_only=True
+            )
+        elif key in state_dict:
+            raise ValueError("A home-placement checkpoint requires periodic EPLB to be enabled.")
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
         )
-        if not self.home_update_interval and prefix + "_extra_state" in missing_keys:
-            missing_keys.remove(prefix + "_extra_state")
+        if not self.home_update_interval and extra_key in missing_keys:
+            missing_keys.remove(extra_key)
 
     def set_extra_state(self, state):
-        """Restore before the first forward; physical checkpoint topology must match."""
-        self.active_home_layout = state["home_layout"].to(self.active_home_layout.device)
-        self.active_replica_layout = state["replica_layout"].to(self.active_home_layout.device)
-        self._pending_replica_layout = None
-        self._load_history = state["load_history"].to(self._load_history.device)
+        """Restore before forward; replay a deferred physical plan on its first use."""
+        if state.get("schema_version") != 1:
+            raise ValueError("Unsupported EPLB checkpoint schema version.")
+        if state["topology"] != self._checkpoint_topology():
+            raise ValueError(
+                "EPLB checkpoint requires the same EP/home/replica and TP/DP topology."
+            )
+        if state["home_update_interval"] != self.home_update_interval:
+            raise ValueError("EPLB checkpoint requires the same home update interval.")
+        home = state["home_layout"]
+        replica = state["replica_layout"]
+        if home.numel():
+            n = home.numel()
+            ep = state["topology"].get("ep", home.shape[0])
+            if self.num_logical_experts is not None and n != self.num_logical_experts:
+                raise ValueError("Invalid EPLB checkpoint expert count.")
+            if (
+                home.dtype != torch.int64
+                or home.ndim != 2
+                or home.shape != (ep, n // ep)
+                or not torch.equal(home.flatten().sort().values, torch.arange(n))
+            ):
+                raise ValueError("Invalid EPLB checkpoint home permutation.")
+            if (
+                replica.ndim != 2
+                or replica.shape[0] != home.shape[0]
+                or (
+                    replica.numel() != self.num_redundant_experts
+                    or torch.any(replica < 0)
+                    or torch.any(replica >= n)
+                )
+            ):
+                raise ValueError("Invalid EPLB checkpoint replica layout.")
+            if state["load_history"].shape != (n,):
+                raise ValueError("Invalid EPLB checkpoint load history.")
+            pending_home = state["pending_home_layout"]
+            pending_replica = state["pending_replica_layout"]
+            if pending_home is not None and (
+                pending_home.shape != home.shape
+                or pending_home.dtype != home.dtype
+                or not torch.equal(pending_home.flatten().sort().values, torch.arange(n))
+            ):
+                raise ValueError("Invalid EPLB checkpoint deferred home permutation.")
+            if pending_replica is not None and (
+                pending_replica.shape != replica.shape
+                or pending_replica.dtype != replica.dtype
+                or torch.any(pending_replica < 0)
+                or torch.any(pending_replica >= n)
+            ):
+                raise ValueError("Invalid EPLB checkpoint deferred replica layout.")
+        if (state["pending_version"] is None) != (state["pending_home_layout"] is None):
+            raise ValueError("Invalid EPLB checkpoint deferred home version.")
+        if state["pending_version"] is not None and (
+            state["pending_version"] != state["version"] or state["pending_replica_layout"] is None
+        ):
+            raise ValueError("Invalid EPLB checkpoint deferred home plan.")
+        device = self.active_home_layout.device
+        self.active_home_layout = home.to(device).clone()
+        self.active_replica_layout = replica.to(device).clone()
+        self._load_history = state["load_history"].to(device).clone()
         self._steps = state["steps"]
         self._version = state["version"]
         self._last_proposal_step = state["last_proposal_step"]
-        self._pending_version = None
-        self._pending_home_layout = None
+        self._pending_version = state["pending_version"]
+        self._pending_home_layout = state["pending_home_layout"]
+        self._pending_replica_layout = state["pending_replica_layout"]
+        self._restore_pending = self._pending_version is not None
 
     def _validate_inputs(
         self, probs: torch.Tensor, routing_map: torch.Tensor, context: SchedulerContext
@@ -384,6 +532,11 @@ class EPLBLoadPlanner(MoELoadPlanner):
             ):
                 raise ValueError("Restored EPLB checkpoint has a different replica slot topology.")
         home_placement = None
+        if self._restore_pending:
+            logical_to_home = torch.argsort(self.active_home_layout.flatten())
+            candidate = self._pending_home_layout.to(loads.device)
+            home_placement = HomeExpertPlacement(logical_to_home[candidate], self._pending_version)
+            self._restore_pending = False
         if (
             context.training
             and self.home_update_interval

@@ -604,6 +604,12 @@ def save_checkpoint(
     start_ckpt = time()
     args = get_args()
 
+    from megatron.core.transformer.moe.home_expert_training import (
+        validate_home_expert_checkpoint_args,
+    )
+
+    validate_home_expert_checkpoint_args(args)
+
     # Keep the safety invariant even when arguments came through a validation path that does not
     # perform the flat CLI cross-check, or were mutated after startup.
     optimizer_config = getattr(optimizer, "config", None) if optimizer is not None else None
@@ -1799,6 +1805,13 @@ def _load_base_checkpoint(
         # 'iteration', etc. don't exist — stash them so DCP doesn't
         # error, then restore placeholder values after load.
         state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
+        for key, value in state_dict.get("model", {}).items():
+            if key.endswith("._planner_state"):
+                for rank_key in value:
+                    if f"model.{key}.{rank_key}" not in state_dict_metadata:
+                        raise RuntimeError(
+                            f"Missing required MoEScheduler checkpoint state: {key}.{rank_key}"
+                        )
         _stashed_keys = {}
         for key in list(state_dict.keys()):
             # Keep the key if it exists as a top-level metadata entry
@@ -1828,6 +1841,9 @@ def _load_base_checkpoint(
             state_dict["optimizer"] = raw_optimizer_state_dict
 
         if raw_model_state_dict is not None:
+            for key, value in state_dict["model"].items():
+                if key.endswith("._planner_state"):
+                    raw_model_state_dict[key] = value
             state_dict["model"] = raw_model_state_dict
     else:
         raise NotImplementedError(f"checkpoint format {ckpt_format} not supported")
@@ -2296,6 +2312,12 @@ def load_checkpoint(
     if state_dict is None:
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
+
+    from megatron.core.transformer.moe.home_expert_training import (
+        validate_home_expert_checkpoint_args,
+    )
+
+    validate_home_expert_checkpoint_args(args, state_dict.get("args"))
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))

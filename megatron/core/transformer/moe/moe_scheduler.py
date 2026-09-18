@@ -175,10 +175,7 @@ class ExpertDispatch(torch.nn.Module, ABC):
 
     @abstractmethod
     def dispatch(
-        self,
-        experts: torch.nn.Module,
-        expert_placement: torch.Tensor,
-        context: SchedulerContext,
+        self, experts: torch.nn.Module, expert_placement: torch.Tensor, context: SchedulerContext
     ) -> None:
         """Materialize the planned expert placement before token dispatch begins."""
 
@@ -263,6 +260,8 @@ class MoEScheduler(torch.nn.Module):
             planner = EPLBLoadPlanner(
                 num_redundant_experts=num_idle_experts,
                 home_update_interval=getattr(config, "moe_scheduler_home_update_interval", 0),
+                num_logical_experts=config.num_moe_experts,
+                pg_collection=pg_collection,
             )
         else:
             from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
@@ -293,6 +292,28 @@ class MoEScheduler(torch.nn.Module):
         return cls(
             planner=planner, expert_dispatch=expert_dispatch, home_expert_dispatch=home_dispatch
         )
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Delegate checkpoint ownership to concrete components."""
+        from megatron.core.transformer.utils import sharded_state_dict_default
+
+        self._check_checkpoint_boundary()
+        state = {}
+        for name, module in self.named_children():
+            state.update(
+                sharded_state_dict_default(module, prefix + name + ".", sharded_offsets, metadata)
+            )
+        return state
+
+    def _check_checkpoint_boundary(self):
+        if self.home_expert_dispatch is not None:
+            self.expert_dispatch.assert_idle()
+            if self.home_expert_dispatch._failed:
+                raise RuntimeError("Cannot checkpoint partially installed home expert state.")
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        self._check_checkpoint_boundary()
+        super()._save_to_state_dict(destination, prefix, keep_vars)
 
     def bind_experts(self, experts: torch.nn.Module) -> None:
         """Bind the layer's native experts to the configured dispatch backend."""

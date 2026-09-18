@@ -8,6 +8,32 @@ from megatron.core.transformer.moe.home_expert_state import optimizer_leaves
 from megatron.core.transformer.moe.moe_scheduler import MoEScheduler
 
 
+def validate_home_expert_checkpoint_args(args, checkpoint_args=None):
+    """Reject formats or topology changes that lose physical expert ownership."""
+    active = getattr(args, "moe_scheduler_home_update_interval", 0)
+    saved = getattr(checkpoint_args, "moe_scheduler_home_update_interval", 0)
+    if not active and not saved:
+        return
+    if args.ckpt_format not in ("torch_dist", "fsdp_dtensor"):
+        raise ValueError("Home expert checkpoints require torch_dist or fsdp_dtensor format.")
+    if checkpoint_args is not None:
+        for name in (
+            "moe_enable_scheduler",
+            "moe_scheduler_planner_type",
+            "moe_scheduler_home_update_interval",
+            "moe_scheduler_num_idle_experts",
+            "num_experts",
+            "expert_model_parallel_size",
+            "expert_tensor_parallel_size",
+            "tensor_model_parallel_size",
+            "pipeline_model_parallel_size",
+            "context_parallel_size",
+            "world_size",
+        ):
+            if getattr(args, name, None) != getattr(checkpoint_args, name, None):
+                raise ValueError(f"Home expert checkpoint requires unchanged {name}.")
+
+
 def prepare_home_expert_step(model, optimizer):
     """Drain old work and defer parameter gathers if any layer has a pending plan.
 

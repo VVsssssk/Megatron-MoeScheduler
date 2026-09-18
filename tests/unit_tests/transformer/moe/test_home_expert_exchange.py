@@ -348,7 +348,7 @@ def test_mcore_optimizer_storage_and_continuation(distributed_world, recipe):
     ddp_config = DistributedDataParallelConfig(
         use_distributed_optimizer=recipe != "ddp",
         use_megatron_fsdp=recipe == "fsdp",
-        data_parallel_sharding_strategy="optim_grads_params" if recipe == "fsdp" else "no_shard",
+        data_parallel_sharding_strategy=("optim_grads_params" if recipe == "fsdp" else "no_shard"),
         overlap_grad_reduce=overlap,
         overlap_param_gather=overlap,
     )
@@ -428,3 +428,136 @@ def test_mcore_optimizer_storage_and_continuation(distributed_world, recipe):
     finally:
         transport.destroy()
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("backend", ["torch_dist", "torch_dcp"])
+def test_eplb_distributed_checkpoint_resume(
+    distributed_world, tmp_path_dist_ckpt, backend, pending
+):
+    """Real serialization preserves rank-local history and a skipped-update proposal."""
+    import torch.distributed.checkpoint as dcp
+
+    from megatron.core import dist_checkpointing
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(expert_model_parallel_size=2, expert_tensor_parallel_size=1)
+    pg = ProcessGroupCollection.use_mpu_process_groups()
+    try:
+
+        def make_planner():
+            return EPLBLoadPlanner(4, 1, num_logical_experts=4, pg_collection=pg)
+
+        planner = make_planner()
+        planner.active_home_layout = torch.tensor([[3, 1], [0, 2]])
+        planner.active_replica_layout = torch.tensor([[1, 3], [2, 0]])
+        planner._load_history = torch.arange(4, dtype=torch.float64) + 10 * pg.dp_cp.rank()
+        planner._steps = 3
+        planner._version = 2
+        planner._last_proposal_step = 2
+        if pending:
+            planner._pending_version = 2
+            planner._pending_home_layout = torch.tensor([[2, 0], [1, 3]])
+            planner._pending_replica_layout = torch.tensor([[0, 2], [1, 3]])
+            planner._last_proposal_step = 3
+        path = tmp_path_dist_ckpt / f"eplb-{backend}-{pending}"
+        if dist.get_rank() == 0:
+            path.mkdir(parents=True, exist_ok=True)
+        dist.barrier()
+        restored = make_planner()
+        if backend == "torch_dist":
+            dist_checkpointing.save(planner.sharded_state_dict(), path)
+            loaded = dist_checkpointing.load(restored.sharded_state_dict(), path)
+        else:
+            dcp.save(planner.state_dict(), checkpoint_id=path)
+            loaded = restored.state_dict()
+            dcp.load(loaded, checkpoint_id=path)
+        restored.load_state_dict(loaded)
+        expected = planner.get_extra_state()
+        actual = restored.get_extra_state()
+        for key in expected:
+            if isinstance(expected[key], torch.Tensor):
+                torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+            else:
+                assert actual[key] == expected[key]
+        # Loaded histories must not all become rank zero's history.
+        assert restored._load_history[0] == 10 * pg.dp_cp.rank()
+        if pending:
+            context = SchedulerContext(
+                1,
+                4,
+                2,
+                tuple(range(pg.ep.rank() * 2, pg.ep.rank() * 2 + 2)),
+                2,
+                pg.ep.rank(),
+                1,
+                True,
+                pg_collection=pg,
+            )
+            routes = torch.eye(4, device="cuda", dtype=torch.bool)
+            home, _, _ = restored.update_placement(routes.float(), routes, context)
+            assert home is not None and home.version == 2
+            expected_sources = torch.argsort(planner.active_home_layout.flatten())[
+                planner._pending_home_layout
+            ]
+            torch.testing.assert_close(home.source_slots.cpu(), expected_sources)
+            again, _, _ = restored.update_placement(routes.float(), routes, context)
+            assert again is None
+            restored.step(home.version)
+            torch.testing.assert_close(
+                restored.active_home_layout.cpu(), planner._pending_home_layout
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_eplb_checkpoint_is_immutable_and_required():
+    planner = EPLBLoadPlanner(2, 1)
+    planner.active_home_layout = torch.tensor([[0, 1], [2, 3]])
+    planner.active_replica_layout = torch.tensor([[0], [1]])
+    planner._load_history = torch.arange(4, dtype=torch.float64)
+    saved = planner.state_dict()
+    planner.active_home_layout.fill_(0)
+    planner._load_history.zero_()
+    restored = EPLBLoadPlanner(2, 1)
+    restored.load_state_dict(saved)
+    assert restored.active_home_layout.tolist() == [[0, 1], [2, 3]]
+    assert restored._load_history.tolist() == [0, 1, 2, 3]
+    for strict in (True, False):
+        with pytest.raises(RuntimeError, match="Missing required MoEScheduler"):
+            restored.load_state_dict({}, strict=strict)
+    with pytest.raises(ValueError, match="same EP/home/replica"):
+        EPLBLoadPlanner(4, 1).load_state_dict(saved)
+    with pytest.raises(ValueError, match="same home update interval"):
+        EPLBLoadPlanner(2, 2).load_state_dict(saved)
+    with pytest.raises(ValueError, match="requires periodic EPLB"):
+        EPLBLoadPlanner(2, 0).load_state_dict(saved)
+
+
+def test_home_checkpoint_rejects_format_and_topology_changes():
+    from megatron.core.transformer.moe.home_expert_training import (
+        validate_home_expert_checkpoint_args,
+    )
+
+    saved = SimpleNamespace(
+        moe_scheduler_home_update_interval=2,
+        ckpt_format="torch_dist",
+        moe_enable_scheduler=True,
+        expert_model_parallel_size=2,
+        moe_scheduler_num_idle_experts=4,
+    )
+    validate_home_expert_checkpoint_args(saved, saved)
+    for name, value in (
+        ("expert_model_parallel_size", 4),
+        ("moe_scheduler_num_idle_experts", 8),
+        ("moe_enable_scheduler", False),
+    ):
+        changed = SimpleNamespace(**vars(saved))
+        setattr(changed, name, value)
+        with pytest.raises(ValueError, match="requires unchanged"):
+            validate_home_expert_checkpoint_args(changed, saved)
+    legacy = SimpleNamespace(**vars(saved))
+    legacy.ckpt_format = "torch"
+    with pytest.raises(ValueError, match="require torch_dist or fsdp_dtensor"):
+        validate_home_expert_checkpoint_args(legacy)
