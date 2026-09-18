@@ -27,6 +27,7 @@ from megatron.core.transformer.enums import (
     InferenceCudaGraphScope,
     LayerType,
 )
+from megatron.core.transformer.moe.mock_router import validate_mock_route_parameters
 from megatron.core.transformer.moe.replica_weight_transport import REPLICA_EXPERT_DISPATCHER_TYPES
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import experimental_api
@@ -864,6 +865,14 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
+
+    moe_router_mock_maxvio: Optional[float] = None
+    """Benchmark-only cached logical expert choices with a target max/mean EP rank load.
+
+    Uses the initial contiguous home layout, before scheduler rerouting. Gate scores
+    remain differentiable; learned selection and balancing auxiliary losses are skipped.
+    None preserves normal routing. The target must be in
+    [1, EP * min(topk, num_moe_experts / EP) / topk]."""
 
     moe_router_force_biased: Optional[float] = None
     """Apply random expert bias in normal distribution with specified std
@@ -2022,6 +2031,41 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_ffn_hidden_size is set but num_moe_experts is None. "
                     "Please set num_moe_experts or remove moe_ffn_hidden_size."
                 )
+
+        if self.moe_router_mock_maxvio is not None:
+            validate_mock_route_parameters(
+                self.num_moe_experts,
+                self.moe_router_topk,
+                self.expert_model_parallel_size,
+                self.moe_router_mock_maxvio,
+            )
+            conflicts = {
+                'moe_router_force_load_balancing': self.moe_router_force_load_balancing,
+                'moe_router_force_biased': self.moe_router_force_biased is not None,
+                'moe_enable_routing_replay': self.moe_enable_routing_replay,
+                'moe_router_enable_expert_bias': self.moe_router_enable_expert_bias,
+                'group-limited routing': self.moe_router_num_groups is not None
+                or self.moe_router_group_topk is not None,
+                'token dropping': self.moe_expert_capacity_factor is not None
+                or self.moe_pad_expert_input_to_capacity
+                or self.moe_token_dropping,
+                'expert tensor parallelism': self.expert_tensor_parallel_size != 1,
+            }
+            routing_types = self.moe_router_load_balancing_type
+            if isinstance(routing_types, str):
+                routing_types = [routing_types]
+            conflicts['sinkhorn/quantile balancing'] = any(
+                t in ('sinkhorn', 'quantile_balancing') for t in routing_types
+            )
+            enabled = [name for name, active in conflicts.items() if active]
+            if enabled:
+                raise ValueError(
+                    f"moe_router_mock_maxvio is incompatible with {', '.join(enabled)}."
+                )
+            warnings.warn(
+                "Mock routing is for performance benchmarks only: learned/Hash-MoE choices "
+                "are replaced and router auxiliary balancing losses are disabled."
+            )
 
         if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
             if not self.moe_grouped_gemm:
