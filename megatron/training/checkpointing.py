@@ -2433,6 +2433,12 @@ def load_checkpoint(
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+            if getattr(args, "moe_scheduler_home_update_interval", 0):
+                from megatron.core.transformer.moe.home_expert_training import (
+                    restore_home_expert_checkpoint_weights,
+                )
+
+                restore_home_expert_checkpoint_weights(optimizer)
         except KeyError as e:
             print_rank_0(
                 'Unable to load optimizer from checkpoint {}. '

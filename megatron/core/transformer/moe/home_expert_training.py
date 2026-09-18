@@ -34,6 +34,31 @@ def validate_home_expert_checkpoint_args(args, checkpoint_args=None):
                 raise ValueError(f"Home expert checkpoint requires unchanged {name}.")
 
 
+@torch.no_grad()
+def restore_home_expert_checkpoint_weights(optimizer):
+    """Rebuild both MXFP8 orientations from restored optimizer master weights.
+
+    A dequantized rowwise checkpoint cannot reconstruct the independent
+    columnwise quantization used by backward. Stage all chained optimizer
+    shards before gathering a shared DDP chunk, just as after a home exchange.
+    FSDP restores its compute weights from master-weight checkpoint tensors.
+    """
+    leaves = [
+        leaf
+        for leaf in optimizer_leaves(optimizer)
+        if getattr(getattr(leaf, "config", None), "reuse_grad_buf_for_mxfp8_param_ag", False)
+        and not getattr(getattr(leaf, "ddp_config", None), "use_megatron_fsdp", False)
+        and not getattr(leaf, "is_stub_optimizer", False)
+    ]
+    chunks = {id(chunk): chunk for leaf in leaves for chunk in leaf.model_chunks}
+    for chunk in chunks.values():
+        chunk.zero_grad_buffer()
+    for leaf in leaves:
+        leaf._copy_main_params_to_param_buffer()
+    for chunk in chunks.values():
+        chunk.start_param_sync(force_sync=True)
+
+
 def prepare_home_expert_step(model, optimizer):
     """Drain old work and defer parameter gathers if any layer has a pending plan.
 
