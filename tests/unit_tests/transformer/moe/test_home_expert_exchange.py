@@ -2,6 +2,8 @@
 
 """Home migration against independent logical optimizer and shard references."""
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import pytest
@@ -430,10 +432,34 @@ def test_mcore_optimizer_storage_and_continuation(distributed_world, recipe):
         Utils.destroy_model_parallel()
 
 
+@pytest.fixture
+def shared_checkpoint_dir(distributed_world):
+    """Use the shared checkout, since pytest's /tmp is node-local under torchrun."""
+    temporary = None
+    paths = [None]
+    if dist.get_rank() == 0:
+        root = Path(__file__).resolve().parents[4] / ".pytest_cache" / "eplb-checkpoints"
+        root.mkdir(parents=True, exist_ok=True)
+        temporary = TemporaryDirectory(prefix="checkpoint-", dir=root)
+        paths[0] = temporary.name
+    dist.broadcast_object_list(paths, src=0)
+    path = Path(paths[0])
+    try:
+        visible = [None] * dist.get_world_size()
+        dist.all_gather_object(visible, path.is_dir())
+        if not all(visible):
+            raise RuntimeError("Checkpoint tests require a checkout shared by every node")
+        yield path
+        dist.barrier()
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
+
+
 @pytest.mark.parametrize("pending", [False, True])
 @pytest.mark.parametrize("backend", ["torch_dist", "torch_dcp"])
 def test_eplb_distributed_checkpoint_resume(
-    distributed_world, tmp_path_dist_ckpt, backend, pending
+    distributed_world, shared_checkpoint_dir, backend, pending
 ):
     """Real serialization preserves rank-local history and a skipped-update proposal."""
     import torch.distributed.checkpoint as dcp
@@ -461,7 +487,7 @@ def test_eplb_distributed_checkpoint_resume(
             planner._pending_home_layout = torch.tensor([[2, 0], [1, 3]])
             planner._pending_replica_layout = torch.tensor([[0, 2], [1, 3]])
             planner._last_proposal_step = 3
-        path = tmp_path_dist_ckpt / f"eplb-{backend}-{pending}"
+        path = shared_checkpoint_dir / f"eplb-{backend}-{pending}"
         if dist.get_rank() == 0:
             path.mkdir(parents=True, exist_ok=True)
         dist.barrier()
