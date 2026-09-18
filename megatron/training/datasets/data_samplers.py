@@ -111,6 +111,10 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         pin_memory=True,
         persistent_workers=True if args.num_workers > 0 else False,
         worker_init_fn=maybe_worker_init_fn,
+        # Iterator construction draws worker base seeds, including with zero
+        # workers. Keep these draws out of the checkpointed training RNG so
+        # rebuilding iterators after a restart does not advance that RNG.
+        generator=torch.Generator().manual_seed(args.seed),
         **extra_kwargs,
     )
 
