@@ -683,11 +683,19 @@ class MoELayer(BaseMoELayer):
             local_balanced_count = local_balanced_count / tp_ep_world_size
         local_balanced = torch.empty((), device=dispatched_input.device, dtype=torch.float32)
         local_balanced.fill_(local_balanced_count)
+        # Nested MTP blocks restart their layer numbering. Use the same MTP
+        # logging offset as the router so their records cannot alias the decoder.
+        logging_layer_number = self.layer_number
+        if self.is_mtp_layer:
+            mtp_layer_number = getattr(self.router, "mtp_layer_number", None) or self.layer_number
+            if self.config.mtp_num_layers is not None:
+                mtp_layer_number = min(mtp_layer_number, self.config.mtp_num_layers)
+            logging_layer_number = self.config.num_layers + mtp_layer_number
         return record_dispatch_token_counts(
             tensor=dispatched_input,
             tokens_per_expert=tokens_per_expert,
             local_balanced_token_count=local_balanced,
-            layer_number=self.layer_number,
+            layer_number=logging_layer_number,
         )
 
     @internal_api
