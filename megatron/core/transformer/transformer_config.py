@@ -3288,8 +3288,12 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_enable_scheduler
             and (
                 self.moe_scheduler_expert_dispatcher_type == "replica_nccl"
-                or (self.moe_scheduler_replica_storage == "layerwise"
-                    and self.moe_scheduler_replica_mxfp8_storage == "separate")
+                or (
+                    self.moe_scheduler_replica_storage == "layerwise"
+                    and (
+                        not self.fp8_param or self.moe_scheduler_replica_mxfp8_storage == "separate"
+                    )
+                )
             )
             and self.cuda_graph_impl != "none"
             and (
@@ -3299,7 +3303,10 @@ class TransformerConfig(ModelParallelConfig):
                 & set(self.cuda_graph_modules)
             )
         ):
-            raise ValueError("replica_nccl host schedules and replica weight caching do not support MoE CUDA graph capture.")
+            raise ValueError(
+                "replica_nccl host schedules and replica weight caching do not support "
+                "MoE CUDA graph capture."
+            )
         assert all(
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules
         ), f"cuda_graph_modules must be a list of CudaGraphModule, got {self.cuda_graph_modules}."

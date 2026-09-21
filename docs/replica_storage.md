@@ -50,6 +50,9 @@ NCCL workspaces share the communication stream and completed-transfer cleanup,
 so layer-local lists do not retain old temporary messages until that layer is
 visited again. Peer-TMA symmetric windows have explicit transport reference
 counts; destroying one shared user does not invalidate the others.
+Completed NCCL handles retain only their completion event and transport;
+the workspace releases packed messages after their GPU work completes, even
+when a layer keeps an old handle for repeated waits.
 
 ## CUDA graphs and diagnostics
 

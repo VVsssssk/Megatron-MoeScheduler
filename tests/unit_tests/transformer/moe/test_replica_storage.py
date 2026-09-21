@@ -2,6 +2,7 @@
 
 """Distributed parity and lifecycle tests for both replica storage policies."""
 
+import weakref
 from dataclasses import replace
 
 import pytest
@@ -25,6 +26,37 @@ from megatron.core.transformer.moe.replica_weight_transport import (
 from tests.unit_tests.transformer.moe.test_replica_nccl_transport import distributed_world
 
 pytestmark = pytest.mark.launch_on_gb200
+
+
+def test_completed_nccl_handle_releases_packed_messages(distributed_world, monkeypatch):
+    cfg = config(distributed_world, "shared", "reuse")
+    transport = NcclP2PTransport(cfg)
+    exchanged = []
+    exchange = transport._exchange
+
+    def track_buffers(sends, sizes, dtype):
+        receives, keepalive = exchange(sends, sizes, dtype)
+        exchanged.extend(weakref.ref(t) for t in (*sends.values(), *receives.values()))
+        return receives, keepalive
+
+    monkeypatch.setattr(transport, "_exchange", track_buffers)
+    plan = transport.prepare_plan(placement(cfg))
+    src = sources(cfg, ReplicaWeightLayout.ROWWISE)
+    try:
+        retained_handle = transport.start_weight_sync(sources=src, plan=plan)
+        transport.wait_weight_sync(retained_handle)
+        torch.cuda.synchronize()
+        previous_buffers = tuple(exchanged)
+        assert previous_buffers
+        next_handle = transport.start_weight_sync(sources=src, plan=plan)
+        # A completed handle may outlive the transfer, without retaining the
+        # packed sends/receives after workspace completion cleanup.
+        assert all(ref() is None for ref in previous_buffers)
+        transport.wait_weight_sync(retained_handle)
+        transport.wait_weight_sync(next_handle)
+        torch.cuda.synchronize()
+    finally:
+        transport.destroy()
 
 
 def config(group, storage, layouts, weight_format="mxfp8"):

@@ -420,7 +420,10 @@ class NcclP2PTransport(ReplicaWeightTransport):
         done = torch.cuda.Event()
         done.record(self._stream)
         self._inflight.append((done, keepalive))
-        return ReplicaTransferHandle(self, done, keepalive)
+        # The workspace owns asynchronous inputs until completion. A runtime
+        # retains its completed handle for repeated consumer waits; attaching
+        # packed messages there would retain a full temporary copy per layer.
+        return ReplicaTransferHandle(self, done)
 
     @torch.no_grad()
     def start_weight_sync(
