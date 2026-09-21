@@ -12,6 +12,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from megatron.core.transformer.moe.replica_storage import get_native_grad_storage
 from megatron.core.transformer.moe.replica_weight_transport import (
     ReplicaGradDestination,
     ReplicaPreparedPlan,
@@ -43,10 +44,11 @@ class _PeerTmaWorkspaceConfig:
     columnwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None
     grad_dtype: torch.dtype
     num_sms: int
+    replica_mxfp8_storage: str
 
 
 class _PeerTmaWorkspace:
-    """Fixed symmetric arenas shared by compatible MoE layers on one EP group."""
+    """Fixed symmetric arenas, optionally shared by compatible MoE layers."""
 
     def __init__(
         self, *, group: dist.ProcessGroup, device: torch.device, config: _PeerTmaWorkspaceConfig
@@ -100,6 +102,15 @@ class _PeerTmaWorkspace:
                 device=device,
             )
             self.weight_handle = symm_mem.rendezvous(self.weight_arena, group)
+            self.columnwise_weight_arena = self.weight_arena
+            self.columnwise_weight_handle = self.weight_handle
+            if mxfp8 and config.replica_mxfp8_storage == "separate":
+                self.columnwise_weight_arena = symm_mem.empty(
+                    self.weight_arena.numel(), dtype=torch.uint8, device=device
+                )
+                self.columnwise_weight_handle = symm_mem.rendezvous(
+                    self.columnwise_weight_arena, group
+                )
             self.grad_arena = symm_mem.empty(arena_numel, dtype=self.grad_dtype, device=device)
             self.grad_handle = symm_mem.rendezvous(self.grad_arena, group)
         except RuntimeError as exc:
@@ -109,14 +120,15 @@ class _PeerTmaWorkspace:
             ) from exc
 
         self.weight_arena.zero_()
+        self.columnwise_weight_arena.zero_()
         self.grad_arena.zero_()
         self.weight_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         self.grad_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         self.weight_stream = torch.cuda.Stream(device=device, priority=0)
         self.weight_stream_fallback = torch.cuda.Stream(device=device, priority=0)
         self.grad_stream = torch.cuda.Stream(device=device, priority=0)
-        self._native_projection_grad_storage: dict[int, torch.Tensor] = {}
         self._destroyed = False
+        self.users = 0
 
         compile_replica_weight_kernels(
             world_size=self.world_size,
@@ -140,7 +152,7 @@ class _PeerTmaWorkspace:
         raise RuntimeError("Replica weight streams alias the active CUDA stream.")
 
     def validate(self, config: _PeerTmaWorkspaceConfig) -> None:
-        """Reject heterogeneous layers instead of creating a shape-keyed memory pool."""
+        """Check a cached workspace against its complete storage specification."""
         if config != self.config:
             raise ValueError(
                 "All replica-planned MoE layers on an EP group must share one weight shape and "
@@ -169,14 +181,16 @@ class _PeerTmaWorkspace:
             )
         )
         rowwise_data, columnwise_data = (
-            self.weight_arena.narrow(0, offset, count * member_numel).view(count, *member_shape)
-            for _ in range(2)
+            arena.narrow(0, offset, count * member_numel).view(count, *member_shape)
+            for arena in (self.weight_arena, self.columnwise_weight_arena)
         )
         scales = self.weight_arena.narrow(
             0, offset + count * member_numel, count * self.scale_numels[projection_index]
         )
         rowwise_scale = scales.view(count, *self.rowwise_scale_shapes[projection_index])
-        columnwise_scale = scales.view(count, *self.columnwise_scale_shapes[projection_index])
+        columnwise_scale = self.columnwise_weight_arena.narrow(
+            0, offset + count * member_numel, count * self.scale_numels[projection_index]
+        ).view(count, *self.columnwise_scale_shapes[projection_index])
         return (
             tuple(
                 (rowwise_data[i], rowwise_scale[i], columnwise_data[i], columnwise_scale[i])
@@ -185,32 +199,21 @@ class _PeerTmaWorkspace:
             virtual_grad,
         )
 
-    def native_projection_grad_view(self, projection_index: int) -> torch.Tensor:
-        """Return shared full-gradient staging for one projection."""
-        cached = self._native_projection_grad_storage.get(projection_index)
-        if cached is None:
-            cached = torch.empty(
-                (self.num_local_home_experts, *self.member_shapes[projection_index]),
-                dtype=self.grad_dtype,
-                device=self.device,
-            )
-            self._native_projection_grad_storage[projection_index] = cached
-        return cached
-
     def destroy(self) -> None:
         """Release symmetric registrations while their NCCL group is still alive."""
         if self._destroyed:
             return
         torch.cuda.synchronize(self.device)
-        self._native_projection_grad_storage.clear()
         self.weight_handle = None
+        self.columnwise_weight_handle = None
+        self.columnwise_weight_arena = None
         self.grad_handle = None
         self.weight_arena = None
         self.grad_arena = None
         self._destroyed = True
 
 
-_peer_tma_workspaces: dict[tuple[int, int | None], _PeerTmaWorkspace] = {}
+_peer_tma_workspaces: dict[tuple, _PeerTmaWorkspace] = {}
 
 
 def _get_peer_tma_workspace(config: ReplicaTransportConfig) -> _PeerTmaWorkspace:
@@ -237,8 +240,15 @@ def _get_peer_tma_workspace(config: ReplicaTransportConfig) -> _PeerTmaWorkspace
         columnwise_scale_shapes=config.columnwise_scale_shapes,
         grad_dtype=config.grad_dtype,
         num_sms=effective_sms,
+        replica_mxfp8_storage=config.replica_mxfp8_storage,
     )
-    key = (id(config.group), config.device.index)
+    # Private workspaces are also registered for collective-safe finalization.
+    key = (
+        id(config.group),
+        config.device.index,
+        workspace_config,
+        object() if config.replica_storage == "layerwise" else None,
+    )
     workspace = _peer_tma_workspaces.get(key)
     if workspace is None:
         workspace = _PeerTmaWorkspace(
@@ -265,6 +275,8 @@ class PeerTmaTransport(ReplicaWeightTransport):
         super().__init__(config)
         self.rank = dist.get_rank(group=config.group)
         self.workspace = _get_peer_tma_workspace(config)
+        self.workspace.users += 1
+        self._native_grad_storage = get_native_grad_storage(config)
         register_replica_transport_finalizer("peer_tma", finalize_peer_tma_transports)
         self._destroyed = False
 
@@ -276,7 +288,7 @@ class PeerTmaTransport(ReplicaWeightTransport):
         return self.workspace.projection_views(projection_index)
 
     def native_projection_grad_view(self, projection_index: int) -> torch.Tensor:
-        return self.workspace.native_projection_grad_view(projection_index)
+        return self._native_grad_storage.buffers[projection_index]
 
     @torch.no_grad()
     @nvtx_decorator(message="replica_weight_push_start")
@@ -300,6 +312,9 @@ class PeerTmaTransport(ReplicaWeightTransport):
         scale_bases = tuple(source.scale_bases for source in sources)
         if workspace.weight_format == "mxfp8" and any(base is None for base in scale_bases):
             raise ValueError("Peer-TMA MXFP8 transport requires device scale pointer tables.")
+        backward = sources[0].layout is ReplicaWeightLayout.COLUMNWISE
+        arena = workspace.columnwise_weight_arena if backward else workspace.weight_arena
+        weight_handle = workspace.columnwise_weight_handle if backward else workspace.weight_handle
         current_stream = torch.cuda.current_stream(self.config.device)
         weight_stream = workspace.select_weight_stream(current_stream)
         weight_stream.wait_stream(current_stream)
@@ -308,9 +323,9 @@ class PeerTmaTransport(ReplicaWeightTransport):
             launch_replica_weight_prefetch(
                 sources=data_bases,
                 scale_sources=scale_bases if workspace.weight_format == "mxfp8" else None,
-                arena=workspace.weight_arena,
-                peer_bases=workspace.weight_handle.buffer_ptrs_dev,
-                signal_bases=workspace.weight_handle.signal_pad_ptrs_dev,
+                arena=arena,
+                peer_bases=weight_handle.buffer_ptrs_dev,
+                signal_bases=weight_handle.signal_pad_ptrs_dev,
                 experts_to_copy=plan.placement.slot_to_expert,
                 grid_barrier=workspace.weight_grid_barrier,
                 rank=self.rank,
@@ -378,7 +393,14 @@ class PeerTmaTransport(ReplicaWeightTransport):
         """Drop layer-local completion objects while retaining the shared workspace."""
         if self._destroyed:
             return
+        workspace = self.workspace
+        workspace.users -= 1
+        if not workspace.users:
+            workspace.destroy()
+            for key in [key for key, value in _peer_tma_workspaces.items() if value is workspace]:
+                del _peer_tma_workspaces[key]
         self.workspace = None
+        self._native_grad_storage = None
         self._destroyed = True
 
 

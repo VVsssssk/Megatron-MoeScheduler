@@ -276,6 +276,8 @@ def _config(group, dtype=torch.float32):
         columnwise_scale_shapes=None,
         grad_dtype=dtype,
         num_sms=None,
+        replica_storage="layerwise",
+        replica_mxfp8_storage="separate",
     )
 
 

@@ -142,6 +142,8 @@ class ReplicaTransportConfig:
     columnwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None
     grad_dtype: torch.dtype
     num_sms: int | None
+    replica_storage: str = "shared"
+    replica_mxfp8_storage: str = "reuse"
     share_native_grad_storage: bool = False
     """Reuse native wgrad staging across serialized layer runtimes on this group.
 
@@ -203,6 +205,10 @@ class ReplicaWeightTransport(ABC):
         raise NotImplementedError(f"{self.transport_name} home expert exchange is not implemented.")
 
     def __init__(self, config: ReplicaTransportConfig) -> None:
+        if config.replica_storage not in ("shared", "layerwise"):
+            raise ValueError("replica_storage must be shared or layerwise.")
+        if config.replica_mxfp8_storage not in ("reuse", "separate"):
+            raise ValueError("replica_mxfp8_storage must be reuse or separate.")
         self.config = config
         if config.weight_format not in self.capabilities.weight_formats:
             raise ValueError(

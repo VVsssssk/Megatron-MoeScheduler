@@ -967,6 +967,12 @@ class TransformerConfig(ModelParallelConfig):
     Existing configs using the old ``replica_hybridep`` name must use ``replica_peer_tma``.
     """
 
+    moe_scheduler_replica_storage: Literal['shared', 'layerwise'] = "shared"
+    """Share replica weights/gradients across layers or allocate per runtime."""
+
+    moe_scheduler_replica_mxfp8_storage: Literal['reuse', 'separate'] = "reuse"
+    """Alias MXFP8 directional storage or keep independent row/column bytes."""
+
     moe_scheduler_num_idle_experts: Optional[int] = None
     """Number of transient physical expert slots added across the EP group.
 
@@ -2146,6 +2152,15 @@ class TransformerConfig(ModelParallelConfig):
                     "Unsupported moe_scheduler_expert_dispatcher_type; expected one of "
                     f"{REPLICA_EXPERT_DISPATCHER_TYPES}."
                 )
+            if self.moe_scheduler_replica_storage not in ("shared", "layerwise"):
+                raise ValueError("moe_scheduler_replica_storage must be shared or layerwise.")
+            if self.moe_scheduler_replica_mxfp8_storage not in ("reuse", "separate"):
+                raise ValueError("moe_scheduler_replica_mxfp8_storage must be reuse or separate.")
+            if self.moe_scheduler_expert_dispatcher_type == "replica_hybridep" and (
+                self.moe_scheduler_replica_storage != "shared"
+                or self.moe_scheduler_replica_mxfp8_storage != "reuse"
+            ):
+                raise ValueError("Replica storage options require peer TMA or NCCL P2P.")
             if self.moe_scheduler_home_update_interval < 0:
                 raise ValueError("moe_scheduler_home_update_interval must be non-negative.")
             if self.moe_scheduler_home_update_interval:
@@ -3271,7 +3286,11 @@ class TransformerConfig(ModelParallelConfig):
         self.cuda_graph_modules = normalized_scopes
         if (
             self.moe_enable_scheduler
-            and self.moe_scheduler_expert_dispatcher_type == "replica_nccl"
+            and (
+                self.moe_scheduler_expert_dispatcher_type == "replica_nccl"
+                or (self.moe_scheduler_replica_storage == "layerwise"
+                    and self.moe_scheduler_replica_mxfp8_storage == "separate")
+            )
             and self.cuda_graph_impl != "none"
             and (
                 self.cuda_graph_impl == "full_iteration"
@@ -3280,7 +3299,7 @@ class TransformerConfig(ModelParallelConfig):
                 & set(self.cuda_graph_modules)
             )
         ):
-            raise ValueError("replica_nccl host schedules do not support MoE CUDA graph capture.")
+            raise ValueError("replica_nccl host schedules and replica weight caching do not support MoE CUDA graph capture.")
         assert all(
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules
         ), f"cuda_graph_modules must be a list of CudaGraphModule, got {self.cuda_graph_modules}."
