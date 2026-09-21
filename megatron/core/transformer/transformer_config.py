@@ -2198,8 +2198,10 @@ class TransformerConfig(ModelParallelConfig):
                     "Replica expert dispatch requires "
                     "at least one replica slot per expert-parallel rank."
                 )
-            if self.moe_expert_rank_capacity_factor is None:
-                self.moe_expert_rank_capacity_factor = 1.0
+            # Preserve the caller's dropless dynamic-capacity choice. A planner
+            # cannot guarantee every rank fits the mean token count, especially
+            # after per-expert padding. An implicit static budget can drop tokens
+            # without installing training's CLI-controlled overflow retry runner.
             replica_mxfp8 = (
                 self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
             )
@@ -2249,8 +2251,9 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_ffn_hidden_size divisible by 128",
                 ),
                 (
-                    self.moe_expert_rank_capacity_factor >= 1.0,
-                    "moe_expert_rank_capacity_factor>=1.0",
+                    self.moe_expert_rank_capacity_factor is None
+                    or self.moe_expert_rank_capacity_factor >= 1.0,
+                    "moe_expert_rank_capacity_factor=None or >=1.0",
                 ),
                 (
                     not self.moe_router_padding_for_quantization or replica_mxfp8,
@@ -3284,6 +3287,20 @@ class TransformerConfig(ModelParallelConfig):
             )
             setattr(self, migration_attr, migration_value)
         self.cuda_graph_modules = normalized_scopes
+        if (
+            self.moe_enable_scheduler
+            and self.moe_expert_rank_capacity_factor is None
+            and self.cuda_graph_impl != "none"
+            and (
+                self.cuda_graph_impl == "full_iteration"
+                or not self.cuda_graph_modules
+                or CudaGraphModule.moe in self.cuda_graph_modules
+            )
+        ):
+            raise ValueError(
+                "MoEScheduler MoE CUDA graph capture requires an explicit "
+                "moe_expert_rank_capacity_factor; dynamic dropless dispatch uses host synchronization."
+            )
         if (
             self.moe_enable_scheduler
             and (

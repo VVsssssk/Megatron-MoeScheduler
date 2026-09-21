@@ -56,6 +56,14 @@ when a layer keeps an old handle for repeated waits.
 
 ## CUDA graphs and diagnostics
 
+An unset `--moe-expert-rank-capacity-factor` preserves HybridEP's dynamic,
+dropless dispatch for both transports. The scheduler does not imply a static
+capacity of 1.0: a planner can leave a rank above the mean token count, and
+per-expert padding can increase the required capacity further. Explicit static
+capacity remains supported and requires the training overflow retry path when
+the budget is exceeded. Capturing MoE requires an explicit static capacity;
+dynamic output sizing synchronizes with the host.
+
 The exact cache requires host decisions and cannot run inside a captured MoE
 region. Attention-only CUDA graphs remain supported. NCCL retains its existing
 restriction against captured host-scheduled MoE communication.
@@ -70,3 +78,14 @@ and all four policies with BF16/MXFP8, exact bytes/scales, additive gradients,
 consumer streams, rank-asymmetric cache invalidation, old placement restoration,
 and real TE MXFP8 forward/dgrad GEMMs with repeated runtime prefetch requests.
 The existing NCCL transport and runtime boundary suites remain regression tests.
+
+`test_scheduler_bf16_layer_parity.py` compares a real scheduler-disabled
+MoELayer against each transport, using identical initial weights, inputs and
+upstream gradients. On four GB200 GPUs it checks forward, input gradients,
+router/expert gradients, and one distributed Adam update with one or four
+microbatches. It checks FP32 master-weight deltas as well as BF16 weights, so
+the initial parameter magnitude cannot hide an incorrect optimizer update.
+This is a paired production-path diagnostic, not an independent mathematical
+reference. A separate insufficient-static-capacity control must report both
+dispatch overflow and numerical disagreement. The six cases pass per rank;
+dynamic-capacity forward and input gradients match exactly in this recipe.
