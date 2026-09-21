@@ -58,9 +58,18 @@ def test_replica_gradient_handoff_respects_fsdp_overwrite(distributed_world, ove
     parameter.grad_added_to_main_grad = False
     parameter.overwrite_main_grad = overwrite
     source = torch.arange(6, device="cuda", dtype=torch.float32).reshape(2, 3)
+    released = []
+
+    def release_workspace():
+        expected = source if overwrite else source + 7
+        torch.testing.assert_close(parameter.main_grad, expected, rtol=0, atol=0)
+        released.append(True)
+
     context = SimpleNamespace(
         runtime=SimpleNamespace(
-            source_parameters=(parameter,), wait_grad_reduce=lambda plan: (source,)
+            source_parameters=(parameter,),
+            wait_grad_reduce=lambda plan: (source,),
+            release_workspace=release_workspace,
         ),
         context=SimpleNamespace(plan=None),
         num_source_parameters=1,
@@ -69,6 +78,7 @@ def test_replica_gradient_handoff_respects_fsdp_overwrite(distributed_world, ove
     expected = source if overwrite else source + 7
     torch.testing.assert_close(parameter.main_grad, expected, rtol=0, atol=0)
     assert parameter.grad_added_to_main_grad
+    assert released == [True]
 
 
 def test_deferred_home_cycles_preserve_adam_continuation(ep_group):

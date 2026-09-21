@@ -2,6 +2,7 @@
 
 """Backend-independent replica consumer fences and exact directional caches."""
 
+import logging
 import weakref
 from dataclasses import dataclass
 
@@ -72,6 +73,7 @@ class ReplicaWeightCache:
         self.group = group
         self.device = device
         self.entries = {}
+        self._reported_layouts = set()
         self.hits = 0
         self.misses = 0
         self._miss = torch.zeros((), dtype=torch.int32, device=device)
@@ -98,6 +100,12 @@ class ReplicaWeightCache:
             self.misses += 1
             return None
         self.hits += 1
+        if layout not in self._reported_layouts:
+            self._reported_layouts.add(layout)
+            if dist.get_rank(self.group) == 0:
+                logging.getLogger(__name__).info(
+                    "Replica weight cache hit: layout=%s; prefetch skipped", layout.value
+                )
         return entry.handle
 
     def remember(self, layout, placement, sources, handle):
@@ -156,5 +164,3 @@ def get_native_grad_storage(config: ReplicaTransportConfig) -> ReplicaNativeGrad
         storage = ReplicaNativeGradStorage(config)
         _native_grad_storage[key] = storage
     return storage
-
-
