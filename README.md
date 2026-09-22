@@ -213,13 +213,15 @@ The same architecture is available as standalone PlantUML sources:
 | Planner | `echo` | `EchoLoadPlanner` | CUDA/Triton assignment and token reroute aligned with Echo PR #2368. |
 | Planner | `eplb` | `EPLBLoadPlanner` | Greedy replication, optional periodic home LPT permutations, and global round-robin rerouting. |
 | Planner | `moon_ep` | `MoonEPLoadPlanner` | PR #6892 fused per-step placement: one cooperative kernel with symmetric-memory histogram exchange. |
+| Planner | `ultra_ep` | `UltraEPLoadPlanner` | PR #2 quota forward with saved routing for backward; fixed homes. |
 | Expert dispatch | `replica_peer_tma` | `ReplicaExpertDispatch` | One replica lifecycle implementation; the type currently selects `PeerTmaTransport`. |
 | Expert dispatch | `replica_hybridep` | Same dispatcher, `HybridEPWeightTransport` | Placeholder; raises `NotImplementedError` before transport allocation. |
 | Expert dispatch | `replica_nccl` | Same dispatcher, `NcclP2PTransport` | Packed NCCL P2P; BF16/MXFP8 weights, BF16/FP32 gradients, host planning. |
+| Expert dispatch | `replica_ultraep` | Same dispatcher, `UltraEPTransport` | PR #2 explicit placement; BF16 weights, FP32 joint gradients, host validation and EP fences. |
 
-UltraEP is a planned integration. It should implement the same common planner
-output or expert-dispatch input semantics instead of exposing UltraEP-native
-metadata in the public interface.
+UltraEP PR #2 is available through the experimental `ultra_ep` planner and
+`replica_ultraep` weight transport. See [UltraEP integration](#ultraep-integration-pr-2)
+for the pinned API, first-version limits and validation commands.
 
 ## Execution Flow
 
@@ -237,9 +239,10 @@ metadata in the public interface.
    expert-weight communication is in flight.
 9. The existing token dispatcher consumes the physical routing tensors and
    runs the normal dispatch, expert compute, and combine stages.
-10. During backward, the replica runtime starts FC2 reduction directly behind
-   its wgrad GEMM, starts pending FC1/FC2 reductions after dispatch backward,
-   and waits at the layer input before publishing source gradients.
+10. During backward, transports with separate projection reductions start FC2
+    after its wgrad GEMM. UltraEP waits until both FC1/FC2 gradients are ready
+    after dispatch backward. The runtime waits at the layer input before
+    publishing source gradients.
 
 ## Configuration
 
@@ -258,7 +261,7 @@ Peer-TMA, despite its name. It has been renamed to `replica_peer_tma`, which
 is also the default. Update existing YAML/CLI configurations to that value.
 `replica_hybridep` is now reserved for the actual HybridEP weight backend and
 fails with a migration message; it never silently selects a different data
-path. All three values construct `ReplicaExpertDispatch` from
+path. All replica backends construct `ReplicaExpertDispatch` from
 `replica_expert_dispatch.py`; the common dispatcher has no transport-specific
 name or compatibility alias. The HybridEP placeholder is accepted by
 configuration validation but cannot execute or bind weights.
@@ -334,12 +337,15 @@ materialization ran.
 | `megatron/core/transformer/moe/eplb_moe_scheduler.py` | EPLB greedy replication, fixed-home LPT placement, and round-robin reroute. |
 | `megatron/core/transformer/moe/moonep_moe_scheduler.py` | MoonEP/PR #6892 planner adapter and common-IR conversion. |
 | `megatron/core/transformer/moe/moonep_replica_triton.py` | #6892 histogram/placement and route-mapping Triton kernels. |
+| `megatron/core/transformer/moe/ultraep_moe_scheduler.py` | UltraEP quota planner and saved routing for probability gradients. |
 | `megatron/core/transformer/moe/replica_expert_dispatch.py` | Common placement adapter and replica forward/backward lifecycle. |
 | `megatron/core/transformer/moe/replica_expert_runtime.py` | TE/GTP runtime weights, gradient handoff, and transport coordination. |
 | `megatron/core/transformer/moe/replica_weight_transport.py` | Backend-neutral replica weight/gradient transport contract and factory. |
 | `megatron/core/transformer/moe/replica_peer_tma_transport.py` | Symmetric-memory peer-TMA transport and shared workspace. |
 | `megatron/core/transformer/moe/replica_hybridep_transport.py` | Reserved HybridEP weight backend; not implemented. |
 | `megatron/core/transformer/moe/replica_nccl_transport.py` | Packed NCCL P2P, host schedules, and FP32 gradient accumulation. |
+| `megatron/core/transformer/moe/replica_ultraep_transport.py` | Explicit UltraEP maps, weight synchronization and joint FP32 gradient reduction. |
+| `megatron/core/transformer/moe/ultraep_backend.py` | Optional dependency/API checks and collective Manager lifetime. |
 | `megatron/core/transformer/moe/replica_weight_triton.py` | #6892 weight transport and projection-selective gradient-reduction kernels, generalized to variable replica slots. |
 | `megatron/core/transformer/moe/moe_layer.py` | Integration between logical routing and the existing token dispatcher. |
 | `megatron/core/transformer/transformer_config.py` | Scheduler configuration and compatibility validation. |
@@ -349,6 +355,9 @@ materialization ran.
 | `tests/unit_tests/transformer/moe/test_moonep_moe_scheduler.py` | MoonEP planner and cross-component compatibility tests. |
 | `tests/unit_tests/transformer/moe/test_replica_weight_transport.py` | Plan ownership, layout, completion lifetime, and placeholder contracts. |
 | `tests/unit_tests/transformer/moe/test_replica_nccl_transport.py` | NCCL weight/gradient parity, strided EP subgroups, empty ranks, and stream completion. |
+| `tests/unit_tests/transformer/moe/test_ultraep_moe_scheduler.py` | UltraEP API, placement, configuration and saved-router contracts. |
+| `tests/unit_tests/transformer/moe/test_replica_ultraep_transport.py` | Native UltraEP communication and fused TE expert parity. |
+| `tests/unit_tests/transformer/moe/test_ultraep_moe_layer.py` | Complete MoELayer forward/backward numerical parity against an unscheduled all-to-all reference. |
 
 ## Replica Transport Contract
 
@@ -485,8 +494,10 @@ To add a planner:
 
 1. Subclass `MoELoadPlanner` and implement `update_placement()`, `reroute()`,
    and, when needed, `should_plan()`.
-2. Return `physical_to_logical_map` plus a `MoEPlacementResult` subclass from
-   `update_placement()`. Keep backend-specific allocation state in that result.
+2. Return `(home_placement, replica_sources, private_state)` from
+   `update_placement()`. Either placement may be `None`; replica sources use
+   current physical home slots. Keep rerouting maps and backend state in the
+   `MoEPlacementResult` carried by `private_state`.
 3. Return dense physical `routing_map` and `probs` from `reroute()`.
 4. Register the planner in `MoEScheduler.from_config()` and
    `TransformerConfig` validation.
@@ -514,6 +525,137 @@ python -m torch.distributed.run --nproc-per-node 8 -m pytest \
   tests/unit_tests/transformer/moe/test_eplb_moe_scheduler.py \
   tests/unit_tests/transformer/moe/test_moonep_moe_scheduler.py
 ```
+
+## UltraEP Integration (PR #2)
+
+This integration targets [UltraEP PR #2](https://github.com/Dots-Infra/UltraEP/pull/2),
+head `6f27b25e7f03f4166c3721dffcf01d1051b1206a` in `xinming-wei/UltraEP`.
+The PR was still open on 2026-09-18; verify the final merged revision before
+updating the dependency. Apply
+[`docker/patches/ultraep-manager-lifetime.patch`](docker/patches/ultraep-manager-lifetime.patch)
+to that checkout before building it and its NVSHMEM dependency **inside the
+development container**, following the upstream installation instructions:
+
+```bash
+# Run from the pinned UltraEP checkout; use the absolute Megatron checkout path.
+git apply /path/to/Megatron-MoeScheduler/docker/patches/ultraep-manager-lifetime.patch
+uv pip install --no-build-isolation --no-deps .
+```
+
+The patch keeps the shared NVSHMEM runtime alive until the final Manager is
+destroyed. Unpatched PR #2 assumes one Manager per EP group; this integration
+uses per-layer managers and otherwise exits during multi-layer cleanup. The
+adapter checks a capability exported by the rebuilt extension and rejects an
+unpatched build before allocating buffers. Remove the patch only when an
+upstream revision provides equivalent lifetime support.
+UltraEP is imported only when selected; other backends do not require it.
+
+On top of a working BF16/TE-fuser/HybridEP-token scheduler configuration, select:
+
+```yaml
+moe_enable_scheduler: true
+moe_scheduler_planner_type: ultra_ep
+moe_scheduler_expert_dispatcher_type: replica_ultraep
+moe_scheduler_num_idle_experts: 4  # global count; divisible by EP size
+moe_scheduler_home_update_interval: 0
+moe_expert_rank_capacity_factor: null  # dynamic, dropless receive size
+grad_reduce_in_bf16: false
+```
+
+The integration uses the **home-exchange branch's physical-source contract**:
+
+- `UltraEPLoadPlanner.update_placement()` emits no home proposal and lowers
+  the returned p2l map to `[EP, S]` current-home source slots. UltraEP keeps homes
+  fixed, so its logical IDs equal source-slot IDs in this planner.
+- `UltraEPTransport.prepare_plan()` constructs PR #2's three explicit maps from
+  those physical sources. Model logical identity never enters the transport.
+  It validates master-first inverse maps, one instance per expert per rank,
+  within-domain replication, and identical placement across EP ranks.
+- `weight_sync()` and `grad_reduce()` always receive explicit maps. The transport
+  does not change the manager's internal quota/reroute placement.
+- Router backward uses a snapshot of the actual dense token routes and p2l map.
+  This fully specifies the probability permutation after quota rerouting;
+  no backward reads an overwritten Manager slot. Simply cloning the three maps
+  and then calling UltraEP's native backward would not provide this guarantee.
+- A `split_grad_reduce` transport capability defers FC2's early reduction hook
+  for UltraEP. FC1/FC2 are reduced jointly after dispatch backward, then handed
+  to the existing runtime/GTP gradient path. Other backends keep split reduction.
+
+First-version boundaries:
+
+- BF16 weights and FP32 gradient storage for `replica_ultraep`; FP8/FP4 are rejected.
+- UltraEP keeps rank capacity dynamic when no factor is specified. Placement
+  does not guarantee an exactly balanced load, so an implicit fixed budget can
+  drop tokens. An explicitly selected fixed rank budget requires the caller's
+  overflow/retry handling, such as the Megatron training wrapper.
+- No MoE CUDA graph capture for either UltraEP component. Attention-only capture
+  retains the surrounding scheduler's existing policy.
+- Periodic home migration still requires EPLB + NCCL. UltraEP does not expose
+  the typed optimizer-state exchange needed by `HomeExpertDispatch`.
+- The UltraEP planner can use the existing NCCL or Peer-TMA replica transport
+  subject to their topology requirements. Other planners can use UltraEP
+  communication only when their physical tables satisfy its stricter constraints;
+  invalid placements are rejected, never silently rewritten.
+- Managers/buffers are per layer. With both UltraEP components selected, they
+  share one Manager. Planner-only use allocates minimal nonzero communication
+  scratch because upstream has no allocation-free public solver Manager.
+- Host placement validation and EP NCCL fences before/after each UltraEP
+  transfer prioritize correctness over overlap. The fences cover remote
+  producers, destination completion and replica-buffer reuse; this implementation
+  uses a separate orchestration stream because UltraEP rejects communication
+  stream self-waits. It does not assume PR #2 resolves cross-rank completion by
+  itself. No performance or CUDA-graph equivalence with the upstream full-stack
+  integration is claimed.
+- Native managers are finalized collectively by the existing replica-runtime
+  teardown. Per-layer transport destruction first drains its communication
+  stream and releases its native-gradient staging; native NVSHMEM buffers remain
+  alive until collective finalization. All ranks must construct and use layers
+  in matching order; upstream UltraEP supports one EP process group per process.
+
+Validation in the development container (four NVLink-connected GPUs, matching
+UltraEP build installed):
+
+```bash
+uv run python -m torch.distributed.run --nproc-per-node 4 -m pytest -q \
+  tests/unit_tests/transformer/moe/test_moe_scheduler.py \
+  tests/unit_tests/transformer/moe/test_ultraep_moe_scheduler.py \
+  tests/unit_tests/transformer/moe/test_replica_weight_transport.py \
+  tests/unit_tests/transformer/moe/test_replica_ultraep_transport.py \
+  tests/unit_tests/transformer/moe/test_ultraep_moe_layer.py
+```
+
+The new tests cover map legality, router gradients after multiple forwards
+(including non-contiguous gradients and empty token batches), joint-gradient
+scheduling, transport teardown, native weight/gradient round trips and clearing,
+fresh source pointers, repeated consumer-stream waits, and reuse of older plans.
+The fused TE expert test compares forward results, input/probability gradients,
+and source-weight gradients against independently materialized TE experts,
+including empty home and replica token slots.
+
+On 2026-09-18, the 33 scheduler/transport contract and UltraEP tests passed on
+each of eight GB200 GPUs across two nodes, including collective cleanup of
+multiple Managers. The build used UltraEP `6f27b25` plus the lifetime patch,
+PyTorch 26.06 and TE batch-GEMM `55d6a453`. Another 186 Echo/EPLB/MoonEP/NCCL and
+home-exchange regression cases passed on every rank; neither suite skipped cases.
+
+The complete MoELayer test compares UltraEP with real HybridEP token dispatch
+against an unscheduled all-to-all reference for 20 forward/backward steps,
+with 16,384 tokens per rank, hidden size 4,096 and FFN size 2,048. Routing is
+concentrated on expert 0 to exercise both replicated and unreplicated hotspots,
+including refreshed replicas after home-weight updates. Fused experts handle
+zero-token ranks by running a zero-weighted padded batch and removing it before
+combine. This keeps wgrad
+overwrite and communication hooks active. Frozen expert weights still participate
+in transport collectives without receiving optimizer gradients; plan lifetime
+also covers router-only training. Full GPT training, UltraEP with GTP/FSDP, and
+performance remain separate validation requirements.
+
+Rank 0 prints `ULTRAEP_MOE_LAYER` records with each EP rank's received token count
+and synchronized forward/backward wall times for both paths, in milliseconds.
+`ULTRAEP_MOE_LAYER_SUMMARY` reports medians after five warmup iterations: each
+phase takes the slowest rank, and the total sums both phases within each iteration.
+Printing, diagnostic collectives and manual weight updates are outside the timers.
+These isolated layer timings are observations, not performance assertions.
 
 # Performance Benchmarking
 

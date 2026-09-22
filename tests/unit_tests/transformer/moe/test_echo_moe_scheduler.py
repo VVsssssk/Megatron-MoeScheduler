@@ -23,8 +23,8 @@ from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
 from megatron.core.transformer.moe.replica_expert_dispatch import ReplicaExpertDispatch
 from megatron.core.transformer.moe.replica_weight_triton import _grad_arguments, _push_arguments
 from megatron.core.transformer.spec_utils import get_submodules
-from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.moe.scheduler_test_utils import _scheduler_config
 
 pytestmark = pytest.mark.launch_on_gb200
 
@@ -251,9 +251,12 @@ def test_replica_transport_factory_uses_expert_dispatcher_type(monkeypatch):
         create_replica_weight_transport("unsupported", config)
 
 
-def test_replica_dispatch_preserves_runtime_backward_order():
+@pytest.mark.parametrize("source_trainable", [False, True])
+@pytest.mark.parametrize("hidden_trainable", [False, True])
+def test_replica_dispatch_preserves_runtime_backward_order(source_trainable, hidden_trainable):
     events = []
-    parameter = torch.nn.Parameter(torch.ones(()))
+    parameter = torch.nn.Parameter(torch.ones(()), requires_grad=source_trainable)
+    router_scale = torch.nn.Parameter(torch.ones(()))
 
     class _Runtime:
         source_parameters = (parameter,)
@@ -295,15 +298,18 @@ def test_replica_dispatch_preserves_runtime_backward_order():
 
     dispatcher = _replica_dispatcher()
     dispatcher.runtime = _Runtime()
-    hidden = dispatcher.wrap_layer_input(torch.ones((), requires_grad=True))
+    original_hidden = torch.ones((), requires_grad=hidden_trainable)
+    hidden = dispatcher.wrap_layer_input(original_hidden)
     dispatcher.dispatch(torch.nn.Identity(), torch.tensor([[2, -1], [0, 1]]), _echo_context())
     hidden = dispatcher.before_token_dispatch(hidden)
     hidden = _BackwardMarker.apply(hidden, "dispatch_backward")
     hidden = dispatcher.after_token_dispatch(hidden)
     hidden = _BackwardMarker.apply(hidden, "expert_backward")
+    hidden = hidden * router_scale
     hidden = dispatcher.before_token_combine(hidden)
     hidden = _BackwardMarker.apply(hidden, "combine_backward")
     hidden = dispatcher.after_token_combine(hidden)
+    assert any(slot.in_use for slot in dispatcher._plan_slots)
     hidden.backward()
 
     # Pending reductions run after token dispatch backward; FC2's optional
@@ -319,7 +325,13 @@ def test_replica_dispatch_preserves_runtime_backward_order():
         "wait_grad_reduce",
     ]
     assert not any(slot.in_use for slot in dispatcher._plan_slots)
-    torch.testing.assert_close(parameter.grad, torch.ones_like(parameter))
+    if source_trainable:
+        torch.testing.assert_close(parameter.grad, torch.ones_like(parameter))
+    else:
+        assert parameter.grad is None
+    if not hidden_trainable:
+        assert original_hidden.grad is None
+    torch.testing.assert_close(router_scale.grad, torch.ones_like(router_scale))
 
 
 def test_echo_scheduler_runs_planner_and_dispatch_adapter():
@@ -379,35 +391,6 @@ def test_moe_scheduler_builds_moonep_planner_with_replica_dispatch():
     assert isinstance(scheduler.planner, MoonEPLoadPlanner)
     assert scheduler.planner.num_redundant_experts == 4
     assert isinstance(scheduler.expert_dispatch, ReplicaExpertDispatch)
-
-
-def _scheduler_config(**overrides) -> TransformerConfig:
-    defaults = {
-        "num_layers": 1,
-        "hidden_size": 128,
-        "num_attention_heads": 4,
-        "num_moe_experts": 4,
-        "moe_ffn_hidden_size": 128,
-        "use_cpu_initialization": True,
-        "bf16": True,
-        "params_dtype": torch.bfloat16,
-        "gated_linear_unit": True,
-        "activation_func": torch.nn.functional.silu,
-        "moe_router_topk": 1,
-        "moe_router_pre_softmax": True,
-        "moe_router_dtype": "fp32",
-        "moe_grouped_gemm": True,
-        "use_transformer_engine_op_fuser": True,
-        "gradient_accumulation_fusion": True,
-        "add_bias_linear": False,
-        "moe_token_dispatcher_type": "flex",
-        "moe_flex_dispatcher_backend": "hybridep",
-        "moe_enable_scheduler": True,
-        "moe_scheduler_num_idle_experts": 4,
-        "moe_scheduler_expert_dispatcher_type": "replica_peer_tma",
-    }
-    defaults.update(overrides)
-    return TransformerConfig(**defaults)
 
 
 def test_transformer_config_validates_moe_scheduler_requirements():

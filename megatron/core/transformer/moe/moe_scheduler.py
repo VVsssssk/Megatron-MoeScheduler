@@ -145,7 +145,13 @@ class MoELoadPlanner(torch.nn.Module, ABC):
         *,
         tokens_per_expert: Optional[torch.Tensor] = None,
     ) -> tuple[Optional[HomeExpertPlacement], Optional[torch.Tensor], MoEPlacementResult]:
-        """Return optional home exchange, replica copies, and private reroute state."""
+        """Return optional home exchange, replica copies, and private reroute state.
+
+        Placement is separate from ``reroute()`` so the scheduler can start
+        asynchronous replica-weight dispatch as soon as placement is known.
+        It then calls ``reroute()`` while the weight transfer is in flight,
+        allowing weight communication to overlap token-reroute computation.
+        """
 
     def step(self, completed_version: Optional[int] = None) -> None:
         """Commit completed home placement after a successful optimizer update."""
@@ -160,7 +166,13 @@ class MoELoadPlanner(torch.nn.Module, ABC):
         placement_result: MoEPlacementResult,
         context: SchedulerContext,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return dense physical ``routing_map`` and ``probs`` tensors."""
+        """Return dense physical ``routing_map`` and ``probs`` tensors.
+
+        Consume the state returned by ``update_placement()``. Replica-weight
+        dispatch may still be in flight: rerouting uses only routing and
+        placement metadata, so it can proceed before replica weights arrive.
+        The expert runtime waits for those weights before expert computation.
+        """
 
 
 class ExpertDispatch(torch.nn.Module, ABC):
@@ -236,7 +248,7 @@ class MoEScheduler(torch.nn.Module):
         """Build the configured MoEScheduler backend stack."""
         planner_type = getattr(config, "moe_scheduler_planner_type", None)
         expert_dispatcher_type = getattr(config, "moe_scheduler_expert_dispatcher_type", None)
-        if planner_type not in ("echo", "eplb", "moon_ep"):
+        if planner_type not in ("echo", "eplb", "moon_ep", "ultra_ep"):
             raise ValueError(f"Unsupported MoEScheduler planner: {planner_type}")
         if expert_dispatcher_type not in REPLICA_EXPERT_DISPATCHER_TYPES:
             raise ValueError(
@@ -255,6 +267,7 @@ class MoEScheduler(torch.nn.Module):
         from megatron.core.transformer.moe.echo_moe_scheduler import EchoLoadPlanner
         from megatron.core.transformer.moe.replica_expert_dispatch import ReplicaExpertDispatch
 
+        expert_dispatch = ReplicaExpertDispatch(config=config, pg_collection=pg_collection)
         if planner_type == "echo":
             planner = EchoLoadPlanner(num_idle_experts, assignment_algorithm=assignment_algorithm)
         elif planner_type == "eplb":
@@ -264,12 +277,25 @@ class MoEScheduler(torch.nn.Module):
                 num_redundant_experts=num_idle_experts,
                 home_update_interval=getattr(config, "moe_scheduler_home_update_interval", 0),
             )
+        elif planner_type == "ultra_ep":
+            from megatron.core.transformer.moe.ultraep_moe_scheduler import UltraEPLoadPlanner
+
+            # When both planner and transport use UltraEP, sharing one Manager saves
+            # memory by avoiding a separate planner Manager and its buffers.
+            # With another transport, the planner needs its own UltraEP Manager, which
+            # adds memory on top of the transport's allocations. Its unused weight buffers
+            # use minimal dummy sizes to limit this extra memory.
+            manager_provider = (
+                (lambda: expert_dispatch.runtime.transport.manager)
+                if expert_dispatcher_type == "replica_ultraep"
+                else None
+            )
+            planner = UltraEPLoadPlanner(num_idle_experts, pg_collection.ep, manager_provider)
         else:
             from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
 
             ep_size = getattr(config, "expert_model_parallel_size", 1)
             planner = MoonEPLoadPlanner(num_redundant_experts=num_idle_experts // ep_size)
-        expert_dispatch = ReplicaExpertDispatch(config=config, pg_collection=pg_collection)
         config_signature = (
             str(planner_type),
             str(expert_dispatcher_type),
