@@ -94,10 +94,16 @@ class SchedulerContext:
 class MoEPlacementResult:
     """Opaque planner state passed from ``update_placement`` to ``reroute``.
 
-    The scheduler deliberately does not inspect this object. Concrete planners
+    The scheduler does not inspect planner-private state. Concrete planners
     use subclasses to retain the allocation metadata needed to reroute tokens
     without recomputing placement or storing implicit per-forward state.
+
+    ``max_dispatch_routes_per_rank`` is an optional public capacity guarantee:
+    after rerouting, no rank receives more logical routes than this Python
+    integer. It excludes per-expert transport padding. None makes no promise.
     """
+
+    max_dispatch_routes_per_rank: Optional[int] = None
 
 
 def _validate_reroute_output(
@@ -227,6 +233,7 @@ class MoEScheduler(torch.nn.Module):
         self.planner = planner
         self.expert_dispatch = expert_dispatch
         self.home_expert_dispatch = home_expert_dispatch
+        self.max_dispatch_routes_per_rank: Optional[int] = None
 
     @classmethod
     def from_config(cls, config: Any, pg_collection: Any) -> "MoEScheduler":
@@ -395,6 +402,8 @@ class MoEScheduler(torch.nn.Module):
         tokens_per_expert: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Plan token/expert rerouting and materialize the expert side."""
+        # Bounds belong to this invocation, never a previous placement/shape.
+        self.max_dispatch_routes_per_rank = None
         if not self.planner.should_plan(
             probs, routing_map, context, tokens_per_expert=tokens_per_expert
         ):
@@ -431,6 +440,7 @@ class MoEScheduler(torch.nn.Module):
             replica_expert_placement.numel() if replica_expert_placement is not None else 0
         )
         _validate_reroute_output(num_physical_experts, rerouted_routing_map, rerouted_probs)
+        self.max_dispatch_routes_per_rank = placement_result.max_dispatch_routes_per_rank
         self._log_first_schedule(
             routing_map,
             num_physical_experts,

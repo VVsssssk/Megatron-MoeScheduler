@@ -489,12 +489,16 @@ class MoELayer(BaseMoELayer):
             return probs, routing_map
 
         context = self._build_scheduler_context()
-        return self.moe_scheduler.schedule(
+        probs, routing_map = self.moe_scheduler.schedule(
             probs,
             routing_map,
             self.experts,
             context,
         )
+        self.token_dispatcher.set_dispatch_route_bound(
+            self.moe_scheduler.max_dispatch_routes_per_rank
+        )
+        return probs, routing_map
 
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher.

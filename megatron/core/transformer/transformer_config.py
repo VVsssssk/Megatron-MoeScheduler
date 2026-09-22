@@ -2198,10 +2198,11 @@ class TransformerConfig(ModelParallelConfig):
                     "Replica expert dispatch requires "
                     "at least one replica slot per expert-parallel rank."
                 )
-            # Preserve the caller's dropless dynamic-capacity choice. A planner
-            # cannot guarantee every rank fits the mean token count, especially
-            # after per-expert padding. An implicit static budget can drop tokens
-            # without installing training's CLI-controlled overflow retry runner.
+            # Preserve the caller's capacity policy. Generic planners need dynamic
+            # sizing when no explicit budget is set. A completed MoonEP plan may
+            # separately provide a proven route bound; HybridEP adds per-expert
+            # padding and checks that contract on-device. Never silently rewrite
+            # this flag without installing training's explicit-budget retry runner.
             replica_mxfp8 = (
                 self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
             )
