@@ -692,6 +692,39 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 
 </details>
 
+## Cached mock routing for scheduler benchmarks
+
+Set `--moe-router-mock-maxvio 1.5` to replace learned/Hash-MoE expert choices
+with deterministic logical expert assignments. The target is the maximum EP
+rank assignment count divided by the mean, measured against the **initial**
+contiguous home layout, before scheduler rerouting and alignment padding.
+Each token still selects `topk` distinct experts. Initial rank 0's expert group
+is hot on every source rank; other groups share the remaining routes evenly.
+For E experts, R EP ranks and K routes, the supported range is
+`[1, R * min(K, E/R) / K]`. Integer counts can introduce rounding error.
+
+`MockRouteCache` builds each token-shape/device template once without advancing
+the training RNG. Gate projection and fresh differentiable probability scores
+still run on every forward. The router emits this branch's existing dense bool
+routing map and probability matrix. MoEScheduler's planner performs its normal
+placement and reroute operations; dispatchers and transports need no mock mode.
+EPLB home migration changes physical ownership without changing the cached
+logical expert choices, so actual GPU load can differ from the initial target.
+
+Padding uses device-side valid-token ordinals. With MoEScheduler enabled,
+padded rows retain K dummy routes but have zero scores and gate gradients;
+dummy assignments count toward the planner's physical work. Without the
+scheduler, padded rows are removed from the route map. Warm every shape/device
+before CUDA Graph capture; a cold cache during capture raises explicitly.
+Caches live with the router, are not saved in checkpoints, and are rebuilt
+deterministically. Changing the target requires a new router/cache.
+
+This is a load-benchmark option. It disables routing balancing auxiliary losses
+but retains Z-loss. It rejects force-balance, forced bias, expert-bias updates,
+routing replay, group-limited selection, token dropping, expert TP > 1 and
+Sinkhorn. Leave it unset for ordinary learned routing. Toolkit recipes must also
+use `--no-force-balance` to avoid the launcher's default forced balancing.
+
 ## Contributing
 
 We welcome contributions! Please see [CONTRIBUTING.md](https://github.com/NVIDIA/Megatron-LM/blob/main/CONTRIBUTING.md) for guidelines.

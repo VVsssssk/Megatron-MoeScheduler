@@ -10,6 +10,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.mock_router import MockRouteCache, mock_route_scores
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -196,6 +197,16 @@ class TopKRouter(Router):
         self.input_jitter = None
         self.mtp_layer_number: Optional[int] = None
         self.frozen_expert_bias = False
+        self.mock_route_cache = (
+            MockRouteCache(
+                self.config.num_moe_experts,
+                self.topk,
+                self.config.expert_model_parallel_size,
+                self.config.moe_router_mock_maxvio,
+            )
+            if self.config.moe_router_mock_maxvio is not None
+            else None
+        )
 
         if self.config.moe_n_hash_layers > 0:
             assert layer_number is not None, "layer_number is required for the hash-based router."
@@ -774,6 +785,36 @@ class TopKRouter(Router):
 
         return routing_probs, routing_map
 
+    def _mock_routing(self, logits, padding_mask):
+        """Route valid tokens through a cached prefix, without host reads of padding."""
+        if padding_mask is not None and (
+            padding_mask.numel() != logits.shape[0]
+            or padding_mask.dtype != torch.bool
+            or padding_mask.device != logits.device
+        ):
+            raise ValueError(
+                "Mock routing needs one boolean padding entry per token on the logits device."
+            )
+        indices = self.mock_route_cache.get(logits.shape[0], logits.device)
+        if padding_mask is not None and logits.shape[0] > 0:
+            # Selecting by valid-token ordinal supports changing THD padding in
+            # graph replay. Never key the cache on a mask pointer or call .item().
+            ordinal = (~padding_mask).long().cumsum(0).sub(1).clamp_min(0)
+            indices = indices.index_select(0, ordinal)
+        else:
+            # Dispatchers must not be able to modify the cached semantic IDs.
+            indices = indices.clone()
+        probs = mock_route_scores(
+            logits,
+            indices,
+            self.score_function,
+            self.config.moe_router_pre_softmax,
+            self.config.moe_router_topk_scaling_factor,
+            self.is_hash_layer,
+        )
+        routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, indices, True)
+        return torch.zeros_like(logits).scatter(1, indices, probs), routing_map
+
     def routing(
         self,
         logits: torch.Tensor,
@@ -807,7 +848,9 @@ class TopKRouter(Router):
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
         # Calculate probs and routing_map for token dispatching
-        if self.is_hash_layer:
+        if self.mock_route_cache is not None:
+            probs, routing_map = self._mock_routing(logits, padding_mask)
+        elif self.is_hash_layer:
             assert input_ids is not None, (
                 "input_ids is required for hash-based routing but was None. "
                 "Ensure --moe-n-hash-layers is set correctly and input_ids are passed."
@@ -838,10 +881,16 @@ class TopKRouter(Router):
             and self.config.moe_expert_capacity_factor is None
             and self.config.moe_expert_rank_capacity_factor is None
         )
-        if padding_mask is not None and use_dropless_hybridep:
+        if padding_mask is not None and (
+            use_dropless_hybridep or self.mock_route_cache is not None
+        ):
             valid_tokens = (~padding_mask).unsqueeze(-1)
             probs = probs * valid_tokens
-            routing_map = routing_map & valid_tokens
+            # Scheduler planners consume K assignments per physical token, including
+            # padding. Zero scores remove dummy output and gate gradients; the
+            # dummy routes still count toward the planner's physical work budget.
+            if not (self.mock_route_cache is not None and self.config.moe_enable_scheduler):
+                routing_map = routing_map & valid_tokens
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
@@ -855,7 +904,12 @@ class TopKRouter(Router):
             )
 
         # Apply each aux loss type and attach aux loss autograd function to probs
-        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
+        if (
+            self.mock_route_cache is None
+            and self.training
+            and torch.is_grad_enabled()
+            and self.is_aux_loss_enabled()
+        ):
             # Calculate scores and routing_map for aux loss
             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
                 logits,

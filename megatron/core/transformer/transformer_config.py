@@ -27,6 +27,7 @@ from megatron.core.transformer.enums import (
     InferenceCudaGraphScope,
     LayerType,
 )
+from megatron.core.transformer.moe.mock_router import validate_mock_route_parameters
 from megatron.core.transformer.moe.replica_weight_transport import REPLICA_EXPERT_DISPATCHER_TYPES
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import experimental_api
@@ -865,6 +866,14 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    moe_router_mock_maxvio: Optional[float] = None
+    """Benchmark-only cached logical expert choices with a target max/mean EP rank load.
+
+    Uses the initial contiguous home layout, before scheduler rerouting. Gate scores
+    remain differentiable; learned selection and balancing auxiliary losses are skipped.
+    None preserves normal routing. The target must be in
+    [1, EP * min(topk, num_moe_experts / EP) / topk]."""
+
     moe_router_force_biased: Optional[float] = None
     """Apply random expert bias in normal distribution with specified std
     to router logits. Shared seed across all ranks ensures identical bias.
@@ -957,6 +966,12 @@ class TransformerConfig(ModelParallelConfig):
     ``replica_hybridep`` is a reserved, unimplemented transport.
     Existing configs using the old ``replica_hybridep`` name must use ``replica_peer_tma``.
     """
+
+    moe_scheduler_replica_storage: Literal['shared', 'layerwise'] = "shared"
+    """Share replica weights/gradients across layers or allocate per runtime."""
+
+    moe_scheduler_replica_mxfp8_storage: Literal['reuse', 'separate'] = "reuse"
+    """Alias MXFP8 directional storage or keep independent row/column bytes."""
 
     moe_scheduler_num_idle_experts: Optional[int] = None
     """Number of transient physical expert slots added across the EP group.
@@ -2023,6 +2038,41 @@ class TransformerConfig(ModelParallelConfig):
                     "Please set num_moe_experts or remove moe_ffn_hidden_size."
                 )
 
+        if self.moe_router_mock_maxvio is not None:
+            validate_mock_route_parameters(
+                self.num_moe_experts,
+                self.moe_router_topk,
+                self.expert_model_parallel_size,
+                self.moe_router_mock_maxvio,
+            )
+            conflicts = {
+                'moe_router_force_load_balancing': self.moe_router_force_load_balancing,
+                'moe_router_force_biased': self.moe_router_force_biased is not None,
+                'moe_enable_routing_replay': self.moe_enable_routing_replay,
+                'moe_router_enable_expert_bias': self.moe_router_enable_expert_bias,
+                'group-limited routing': self.moe_router_num_groups is not None
+                or self.moe_router_group_topk is not None,
+                'token dropping': self.moe_expert_capacity_factor is not None
+                or self.moe_pad_expert_input_to_capacity
+                or self.moe_token_dropping,
+                'expert tensor parallelism': self.expert_tensor_parallel_size != 1,
+            }
+            routing_types = self.moe_router_load_balancing_type
+            if isinstance(routing_types, str):
+                routing_types = [routing_types]
+            conflicts['sinkhorn/quantile balancing'] = any(
+                t in ('sinkhorn', 'quantile_balancing') for t in routing_types
+            )
+            enabled = [name for name, active in conflicts.items() if active]
+            if enabled:
+                raise ValueError(
+                    f"moe_router_mock_maxvio is incompatible with {', '.join(enabled)}."
+                )
+            warnings.warn(
+                "Mock routing is for performance benchmarks only: learned/Hash-MoE choices "
+                "are replaced and router auxiliary balancing losses are disabled."
+            )
+
         if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
             if not self.moe_grouped_gemm:
                 raise ValueError(
@@ -2102,6 +2152,15 @@ class TransformerConfig(ModelParallelConfig):
                     "Unsupported moe_scheduler_expert_dispatcher_type; expected one of "
                     f"{REPLICA_EXPERT_DISPATCHER_TYPES}."
                 )
+            if self.moe_scheduler_replica_storage not in ("shared", "layerwise"):
+                raise ValueError("moe_scheduler_replica_storage must be shared or layerwise.")
+            if self.moe_scheduler_replica_mxfp8_storage not in ("reuse", "separate"):
+                raise ValueError("moe_scheduler_replica_mxfp8_storage must be reuse or separate.")
+            if self.moe_scheduler_expert_dispatcher_type == "replica_hybridep" and (
+                self.moe_scheduler_replica_storage != "shared"
+                or self.moe_scheduler_replica_mxfp8_storage != "reuse"
+            ):
+                raise ValueError("Replica storage options require peer TMA or NCCL P2P.")
             if self.moe_scheduler_home_update_interval < 0:
                 raise ValueError("moe_scheduler_home_update_interval must be non-negative.")
             if self.moe_scheduler_home_update_interval:
@@ -2139,8 +2198,11 @@ class TransformerConfig(ModelParallelConfig):
                     "Replica expert dispatch requires "
                     "at least one replica slot per expert-parallel rank."
                 )
-            if self.moe_expert_rank_capacity_factor is None:
-                self.moe_expert_rank_capacity_factor = 1.0
+            # Preserve the caller's capacity policy. Generic planners need dynamic
+            # sizing when no explicit budget is set. A completed MoonEP plan may
+            # separately provide a proven route bound; HybridEP adds per-expert
+            # padding and checks that contract on-device. Never silently rewrite
+            # this flag without installing training's explicit-budget retry runner.
             replica_mxfp8 = (
                 self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
             )
@@ -2190,8 +2252,9 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_ffn_hidden_size divisible by 128",
                 ),
                 (
-                    self.moe_expert_rank_capacity_factor >= 1.0,
-                    "moe_expert_rank_capacity_factor>=1.0",
+                    self.moe_expert_rank_capacity_factor is None
+                    or self.moe_expert_rank_capacity_factor >= 1.0,
+                    "moe_expert_rank_capacity_factor=None or >=1.0",
                 ),
                 (
                     not self.moe_router_padding_for_quantization or replica_mxfp8,
@@ -3227,7 +3290,29 @@ class TransformerConfig(ModelParallelConfig):
         self.cuda_graph_modules = normalized_scopes
         if (
             self.moe_enable_scheduler
-            and self.moe_scheduler_expert_dispatcher_type == "replica_nccl"
+            and self.moe_expert_rank_capacity_factor is None
+            and self.cuda_graph_impl != "none"
+            and (
+                self.cuda_graph_impl == "full_iteration"
+                or not self.cuda_graph_modules
+                or CudaGraphModule.moe in self.cuda_graph_modules
+            )
+        ):
+            raise ValueError(
+                "MoEScheduler MoE CUDA graph capture requires an explicit "
+                "moe_expert_rank_capacity_factor; dynamic dropless dispatch uses host synchronization."
+            )
+        if (
+            self.moe_enable_scheduler
+            and (
+                self.moe_scheduler_expert_dispatcher_type == "replica_nccl"
+                or (
+                    self.moe_scheduler_replica_storage == "layerwise"
+                    and (
+                        not self.fp8_param or self.moe_scheduler_replica_mxfp8_storage == "separate"
+                    )
+                )
+            )
             and self.cuda_graph_impl != "none"
             and (
                 self.cuda_graph_impl == "full_iteration"
@@ -3236,7 +3321,10 @@ class TransformerConfig(ModelParallelConfig):
                 & set(self.cuda_graph_modules)
             )
         ):
-            raise ValueError("replica_nccl host schedules do not support MoE CUDA graph capture.")
+            raise ValueError(
+                "replica_nccl host schedules and replica weight caching do not support "
+                "MoE CUDA graph capture."
+            )
         assert all(
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules
         ), f"cuda_graph_modules must be a list of CudaGraphModule, got {self.cuda_graph_modules}."

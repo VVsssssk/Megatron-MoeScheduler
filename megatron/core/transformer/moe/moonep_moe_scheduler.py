@@ -301,6 +301,7 @@ class MoonEPPlacementResult(MoEPlacementResult):
 
     topk_indices: Optional[torch.Tensor] = None
     workspace: Optional[ReplicaPlannerWorkspace] = None
+    max_dispatch_routes_per_rank: Optional[int] = None
 
 
 class MoonEPLoadPlanner(MoELoadPlanner):
@@ -475,7 +476,15 @@ class MoonEPLoadPlanner(MoELoadPlanner):
             physical_to_logical_map.reshape(context.ep_size, -1)[
                 :, context.num_local_experts :
             ].contiguous(),
-            MoonEPPlacementResult(topk_indices=topk_indices, workspace=workspace),
+            # The distributed planner verifies a full top-k and equal source
+            # route counts, then transfers each receiver's entire deficit.
+            # Consequently every destination receives num_tokens * topk routes.
+            # Identity/single-rank paths intentionally retain the dynamic path.
+            MoonEPPlacementResult(
+                topk_indices=topk_indices,
+                workspace=workspace,
+                max_dispatch_routes_per_rank=topk_indices.numel(),
+            ),
         )
 
     @nvtx_decorator(message="virtual_expert_reroute")

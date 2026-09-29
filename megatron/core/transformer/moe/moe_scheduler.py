@@ -94,10 +94,16 @@ class SchedulerContext:
 class MoEPlacementResult:
     """Opaque planner state passed from ``update_placement`` to ``reroute``.
 
-    The scheduler deliberately does not inspect this object. Concrete planners
+    The scheduler does not inspect planner-private state. Concrete planners
     use subclasses to retain the allocation metadata needed to reroute tokens
     without recomputing placement or storing implicit per-forward state.
+
+    ``max_dispatch_routes_per_rank`` is an optional public capacity guarantee:
+    after rerouting, no rank receives more logical routes than this Python
+    integer. It excludes per-expert transport padding. None makes no promise.
     """
+
+    max_dispatch_routes_per_rank: Optional[int] = None
 
 
 def _validate_reroute_output(
@@ -175,10 +181,7 @@ class ExpertDispatch(torch.nn.Module, ABC):
 
     @abstractmethod
     def dispatch(
-        self,
-        experts: torch.nn.Module,
-        expert_placement: torch.Tensor,
-        context: SchedulerContext,
+        self, experts: torch.nn.Module, expert_placement: torch.Tensor, context: SchedulerContext
     ) -> None:
         """Materialize the planned expert placement before token dispatch begins."""
 
@@ -230,6 +233,7 @@ class MoEScheduler(torch.nn.Module):
         self.planner = planner
         self.expert_dispatch = expert_dispatch
         self.home_expert_dispatch = home_expert_dispatch
+        self.max_dispatch_routes_per_rank: Optional[int] = None
 
     @classmethod
     def from_config(cls, config: Any, pg_collection: Any) -> "MoEScheduler":
@@ -263,6 +267,8 @@ class MoEScheduler(torch.nn.Module):
             planner = EPLBLoadPlanner(
                 num_redundant_experts=num_idle_experts,
                 home_update_interval=getattr(config, "moe_scheduler_home_update_interval", 0),
+                num_logical_experts=config.num_moe_experts,
+                pg_collection=pg_collection,
             )
         else:
             from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
@@ -293,6 +299,28 @@ class MoEScheduler(torch.nn.Module):
         return cls(
             planner=planner, expert_dispatch=expert_dispatch, home_expert_dispatch=home_dispatch
         )
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Delegate checkpoint ownership to concrete components."""
+        from megatron.core.transformer.utils import sharded_state_dict_default
+
+        self._check_checkpoint_boundary()
+        state = {}
+        for name, module in self.named_children():
+            state.update(
+                sharded_state_dict_default(module, prefix + name + ".", sharded_offsets, metadata)
+            )
+        return state
+
+    def _check_checkpoint_boundary(self):
+        if self.home_expert_dispatch is not None:
+            self.expert_dispatch.assert_idle()
+            if self.home_expert_dispatch._failed:
+                raise RuntimeError("Cannot checkpoint partially installed home expert state.")
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        self._check_checkpoint_boundary()
+        super()._save_to_state_dict(destination, prefix, keep_vars)
 
     def bind_experts(self, experts: torch.nn.Module) -> None:
         """Bind the layer's native experts to the configured dispatch backend."""
@@ -374,6 +402,8 @@ class MoEScheduler(torch.nn.Module):
         tokens_per_expert: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Plan token/expert rerouting and materialize the expert side."""
+        # Bounds belong to this invocation, never a previous placement/shape.
+        self.max_dispatch_routes_per_rank = None
         if not self.planner.should_plan(
             probs, routing_map, context, tokens_per_expert=tokens_per_expert
         ):
@@ -410,6 +440,7 @@ class MoEScheduler(torch.nn.Module):
             replica_expert_placement.numel() if replica_expert_placement is not None else 0
         )
         _validate_reroute_output(num_physical_experts, rerouted_routing_map, rerouted_probs)
+        self.max_dispatch_routes_per_rank = placement_result.max_dispatch_routes_per_rank
         self._log_first_schedule(
             routing_map,
             num_physical_experts,

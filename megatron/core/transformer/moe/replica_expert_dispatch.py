@@ -113,6 +113,7 @@ class _ReplicaWaitGradReduce(torch.autograd.Function):
                 )
             )
 
+        ctx.runtime.release_workspace()
         return grad_hidden_states, *autograd_grads, None, None
 
 
@@ -160,6 +161,8 @@ class ReplicaExpertDispatch(ExpertDispatch):
             ),
             grad_dtype=torch.bfloat16 if self.config.grad_reduce_in_bf16 else torch.float32,
             num_sms=self.config.moe_flex_dispatcher_num_sms,
+            replica_storage=self.config.moe_scheduler_replica_storage,
+            replica_mxfp8_storage=self.config.moe_scheduler_replica_mxfp8_storage,
         )
         experts.set_replica_expert_runtime(self.runtime)
 
@@ -241,9 +244,11 @@ class ReplicaExpertDispatch(ExpertDispatch):
         self._active_plan_slot = slot
         self._active_plan = plan
         try:
+            self.runtime.acquire_workspace()
             self.runtime.last_plan = plan
             self.runtime.start_prefetch(plan)
         except Exception:
+            self.runtime.release_workspace()
             self._forward_context.plan = None
             self._forward_context.slot = None
             self._forward_context = None
@@ -303,6 +308,7 @@ class ReplicaExpertDispatch(ExpertDispatch):
             combined_hidden = _ReplicaBackwardHook.apply(
                 combined_hidden, functools.partial(self.runtime.start_backward_prefetch, plan)
             )
+        self.runtime.release_workspace()
         self._active_plan = None
         self._active_plan_slot = None
         self._forward_context = None

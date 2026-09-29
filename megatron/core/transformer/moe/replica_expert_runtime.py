@@ -18,6 +18,10 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.fp8_utils import is_mxfp8tensor
+from megatron.core.transformer.moe.replica_storage import (
+    ReplicaWeightCache,
+    get_replica_consumer_fence,
+)
 from megatron.core.transformer.moe.replica_weight_transport import (
     ReplicaGradDestination,
     ReplicaOwnership,
@@ -519,6 +523,8 @@ class ReplicaExpertRuntime:
         transport_factory: Callable[[ReplicaTransportConfig], ReplicaWeightTransport],
         grad_dtype: torch.dtype = torch.float32,
         num_sms: int | None = None,
+        replica_storage: str = "shared",
+        replica_mxfp8_storage: str = "reuse",
     ) -> None:
         self.group = group
         self.rank = dist.get_rank(group=group)
@@ -574,12 +580,21 @@ class ReplicaExpertRuntime:
             ),
             grad_dtype=grad_dtype,
             num_sms=num_sms,
+            replica_storage=replica_storage,
+            replica_mxfp8_storage=replica_mxfp8_storage,
             # The layer-input backward boundary finishes transport reduction
             # and hands wgrads to their owner before the preceding layer runs.
             # Peer-TMA already uses shared staging under this same lifecycle.
             share_native_grad_storage=True,
         )
         self.transport: ReplicaWeightTransport = transport_factory(transport_config)
+        self._consumer_fence = get_replica_consumer_fence(self.group, self.device)
+        self._workspace_acquired = False
+        self.weight_cache = (
+            ReplicaWeightCache(self.group, self.device)
+            if replica_storage == "layerwise" and (not mxfp8 or replica_mxfp8_storage == "separate")
+            else None
+        )
 
         def pointer_table() -> torch.Tensor:
             return torch.empty(self.num_local_home_experts, dtype=torch.int64, device=self.device)
@@ -784,6 +799,17 @@ class ReplicaExpertRuntime:
             self._prepared_plans[plan] = prepared
         return prepared
 
+    def acquire_workspace(self) -> None:
+        """Fence the last compute reader before any shared storage producer."""
+        self._consumer_fence.acquire(self, self.device)
+        self._workspace_acquired = True
+
+    def release_workspace(self) -> None:
+        """Called after forward consumption or native-gradient publication."""
+        if self._workspace_acquired:
+            self._consumer_fence.release(self, self.device)
+            self._workspace_acquired = False
+
     @torch.no_grad()
     def start_prefetch(
         self, plan: ReplicaPlan, direction: _WeightDirection = _WeightDirection.FORWARD
@@ -797,9 +823,18 @@ class ReplicaExpertRuntime:
         # any one-weight-ahead gather (or performs the cold synchronous gather)
         # and stages the full native experts before the push reads them.
         self.prepare_source_weights(direction)
-        self._prefetch_handle = self.transport.start_weight_sync(
-            sources=self._transport_sources(direction), plan=prepared
+        sources = self._transport_sources(direction)
+        layout = sources[0].layout if self.weight_cache is not None else None
+        handle = (
+            self.weight_cache.lookup(layout, plan.experts_to_copy, sources)
+            if self.weight_cache is not None
+            else None
         )
+        if handle is None:
+            handle = self.transport.start_weight_sync(sources=sources, plan=prepared)
+            if self.weight_cache is not None:
+                self.weight_cache.remember(layout, plan.experts_to_copy, sources, handle)
+        self._prefetch_handle = handle
         self._prefetch_plan = plan
         self._completed_plan = None
         self._completed_handle = None
@@ -830,6 +865,7 @@ class ReplicaExpertRuntime:
 
     def start_backward_prefetch(self, plan: ReplicaPlan) -> None:
         """Start the columnwise/GTP-backward replica weight transfer."""
+        self.acquire_workspace()
         self.start_prefetch(plan, _WeightDirection.BACKWARD)
 
     @torch.no_grad()
@@ -907,6 +943,9 @@ class ReplicaExpertRuntime:
             projection.destroy()
         self.projections.clear()
         self.last_plan = None
+        self.release_workspace()
+        if self.weight_cache is not None:
+            self.weight_cache.clear()
         self.transport.destroy()
         self._prepared_plans.clear()
         self._prefetch_handle = None

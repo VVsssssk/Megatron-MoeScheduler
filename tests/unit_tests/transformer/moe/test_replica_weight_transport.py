@@ -108,6 +108,8 @@ def _runtime():
     runtime._prefetch_handle = runtime._completed_handle = None
     runtime.prepare_source_weights = lambda direction: None
     runtime.projections = ()
+    runtime.weight_cache = None
+    runtime.acquire_workspace = lambda: None
     return runtime
 
 

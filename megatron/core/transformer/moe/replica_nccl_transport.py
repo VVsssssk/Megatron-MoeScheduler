@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from megatron.core.transformer.moe.replica_storage import get_native_grad_storage
 from megatron.core.transformer.moe.replica_weight_transport import (
     HomeExpertPlacement,
     HomePreparedPlan,
@@ -77,38 +78,91 @@ def _compile_schedule(table: list[list[int]], home_experts: int, rank: int) -> _
     )
 
 
-class _NativeGradStorage:
-    """Native gradient staging, optionally shared by serialized layer runtimes."""
+class _NcclWorkspace:
+    """Stable storage and one communication stream for compatible runtimes."""
 
-    def __init__(self, config: ReplicaTransportConfig) -> None:
-        self.buffers = tuple(
+    def __init__(self, config):
+        self._mxfp8 = config.weight_format == "mxfp8"
+        self._numels = tuple(math.prod(shape) for shape in config.member_shapes)
+        self._weights = tuple(
             torch.empty(
-                (config.num_local_home_experts, *shape),
-                dtype=config.grad_dtype,
+                (config.num_local_replica_slots, *shape),
+                dtype=torch.uint8 if self._mxfp8 else torch.bfloat16,
                 device=config.device,
             )
             for shape in config.member_shapes
         )
+        # Directional aliases are opt-in storage policy. The runtime fences
+        # consumers before reuse; separate mode supports persistent caches.
+        self._columnwise_weights = (
+            (
+                tuple(torch.empty_like(weight) for weight in self._weights)
+                if config.replica_mxfp8_storage == "separate"
+                else self._weights
+            )
+            if self._mxfp8
+            else ()
+        )
+        self._scales = {}
+        if self._mxfp8:
+            row_scales, col_scales = [], []
+            for row_shape, col_shape in zip(
+                config.rowwise_scale_shapes, config.columnwise_scale_shapes
+            ):
+                if config.replica_mxfp8_storage == "reuse":
+                    size = max(math.prod(row_shape), math.prod(col_shape))
+                    storage = torch.empty(
+                        (config.num_local_replica_slots, size),
+                        dtype=torch.uint8,
+                        device=config.device,
+                    )
+                    row_scales.append(
+                        storage[:, : math.prod(row_shape)].view(
+                            config.num_local_replica_slots, *row_shape
+                        )
+                    )
+                    col_scales.append(
+                        storage[:, : math.prod(col_shape)].view(
+                            config.num_local_replica_slots, *col_shape
+                        )
+                    )
+                else:
+                    row_scales.append(
+                        torch.empty(
+                            (config.num_local_replica_slots, *row_shape),
+                            dtype=torch.uint8,
+                            device=config.device,
+                        )
+                    )
+                    col_scales.append(
+                        torch.empty(
+                            (config.num_local_replica_slots, *col_shape),
+                            dtype=torch.uint8,
+                            device=config.device,
+                        )
+                    )
+            self._scales[ReplicaWeightLayout.ROWWISE] = tuple(row_scales)
+            self._scales[ReplicaWeightLayout.COLUMNWISE] = tuple(col_scales)
+        self._replica_grads = tuple(
+            torch.empty_like(weight, dtype=config.grad_dtype) for weight in self._weights
+        )
+        self._native_grad_storage = get_native_grad_storage(config)
+        self._native_grads = self._native_grad_storage.buffers
+        self._stream = torch.cuda.Stream(device=config.device)
+        self._inflight: list[tuple[torch.cuda.Event, tuple]] = []
 
 
-_native_grad_storage: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+_nccl_workspaces = weakref.WeakValueDictionary()
 
 
-def _get_native_grad_storage(config: ReplicaTransportConfig) -> _NativeGradStorage:
-    if not config.share_native_grad_storage:
-        return _NativeGradStorage(config)
-    key = (
-        config.group,
-        config.device,
-        config.num_local_home_experts,
-        config.member_shapes,
-        config.grad_dtype,
-    )
-    storage = _native_grad_storage.get(key)
-    if storage is None:
-        storage = _NativeGradStorage(config)
-        _native_grad_storage[key] = storage
-    return storage
+def _get_nccl_workspace(config):
+    if config.replica_storage == "layerwise":
+        return _NcclWorkspace(config)
+    workspace = _nccl_workspaces.get(config)
+    if workspace is None:
+        workspace = _NcclWorkspace(config)
+        _nccl_workspaces[config] = workspace
+    return workspace
 
 
 class NcclP2PTransport(ReplicaWeightTransport):
@@ -122,8 +176,8 @@ class NcclP2PTransport(ReplicaWeightTransport):
 
     Planning synchronously copies the slot table to the host once per plan.
     Dynamic host schedules are not CUDA-graph safe, including when prepared
-    before capture. Replica storage and one communication stream are layer-local.
-    Serialized runtimes may opt into shared native-gradient staging.
+    before capture. Replica storage and one communication stream follow the configured storage policy.
+    Serialized runtimes share replica storage by default and may share native-gradient staging.
     Callers must finish consumers before overwriting reusable replica storage.
     ``num_sms`` is not a portable NCCL P2P launch control and is unused here.
     """
@@ -167,41 +221,16 @@ class NcclP2PTransport(ReplicaWeightTransport):
         self._global_ranks = tuple(
             dist.get_global_rank(config.group, rank) for rank in range(config.world_size)
         )
-        self._numels = tuple(math.prod(shape) for shape in config.member_shapes)
-        self._weights = tuple(
-            torch.empty(
-                (config.num_local_replica_slots, *shape),
-                dtype=torch.uint8 if self._mxfp8 else torch.bfloat16,
-                device=config.device,
-            )
-            for shape in config.member_shapes
-        )
-        # Directions have independent stable storage: backward columnwise copies
-        # must not overwrite forward rowwise data or differently padded scales.
-        self._columnwise_weights = (
-            tuple(torch.empty_like(weight) for weight in self._weights) if self._mxfp8 else ()
-        )
-        self._scales = {}
-        if self._mxfp8:
-            for layout, shapes in (
-                (ReplicaWeightLayout.ROWWISE, config.rowwise_scale_shapes),
-                (ReplicaWeightLayout.COLUMNWISE, config.columnwise_scale_shapes),
-            ):
-                self._scales[layout] = tuple(
-                    torch.empty(
-                        (config.num_local_replica_slots, *shape),
-                        dtype=torch.uint8,
-                        device=config.device,
-                    )
-                    for shape in shapes
-                )
-        self._replica_grads = tuple(
-            torch.empty_like(weight, dtype=config.grad_dtype) for weight in self._weights
-        )
-        self._native_grad_storage = _get_native_grad_storage(config)
-        self._native_grads = self._native_grad_storage.buffers
-        self._stream = torch.cuda.Stream(device=config.device)
-        self._inflight: list[tuple[torch.cuda.Event, tuple]] = []
+        self.workspace = _get_nccl_workspace(config)
+        self._numels = self.workspace._numels
+        self._weights = self.workspace._weights
+        self._columnwise_weights = self.workspace._columnwise_weights
+        self._scales = self.workspace._scales
+        self._replica_grads = self.workspace._replica_grads
+        self._native_grad_storage = self.workspace._native_grad_storage
+        self._native_grads = self.workspace._native_grads
+        self._stream = self.workspace._stream
+        self._inflight = self.workspace._inflight
         # All members participate even when this layer's eventual plan has no
         # traffic on some ranks. This group is borrowed, never destroyed here.
         ready = torch.zeros(1, device=config.device)
@@ -253,7 +282,7 @@ class NcclP2PTransport(ReplicaWeightTransport):
         schedule = plan.metadata
         producer = torch.cuda.current_stream(self.config.device)
         self._stream.wait_stream(producer)
-        self._inflight = [(event, refs) for event, refs in self._inflight if not event.query()]
+        self._inflight[:] = [(event, refs) for event, refs in self._inflight if not event.query()]
         with torch.cuda.stream(self._stream):
             received = tuple(torch.empty_like(source) for source in sources)
             buffers = []
@@ -289,7 +318,7 @@ class NcclP2PTransport(ReplicaWeightTransport):
         """
         self.wait_weight_sync(handle.transfer)
         handle.transfer.completion.synchronize()
-        self._inflight = [(event, refs) for event, refs in self._inflight if not event.query()]
+        self._inflight[:] = [(event, refs) for event, refs in self._inflight if not event.query()]
         for tensor in handle.received:
             tensor.record_stream(torch.cuda.current_stream(self.config.device))
         return handle.received
@@ -344,7 +373,7 @@ class NcclP2PTransport(ReplicaWeightTransport):
         if not isinstance(plan.metadata, _NcclSchedule):
             raise ValueError("replica_nccl requires a compiled NCCL schedule.")
         # Keep inputs alive even if the caller drops a handle before GPU completion.
-        self._inflight = [(event, refs) for event, refs in self._inflight if not event.query()]
+        self._inflight[:] = [(event, refs) for event, refs in self._inflight if not event.query()]
         return plan.metadata
 
     def _validate_tensors(self, tensors, projection: int, dtype: torch.dtype, shape=None) -> None:
@@ -391,7 +420,10 @@ class NcclP2PTransport(ReplicaWeightTransport):
         done = torch.cuda.Event()
         done.record(self._stream)
         self._inflight.append((done, keepalive))
-        return ReplicaTransferHandle(self, done, keepalive)
+        # The workspace owns asynchronous inputs until completion. A runtime
+        # retains its completed handle for repeated consumer waits; attaching
+        # packed messages there would retain a full temporary copy per layer.
+        return ReplicaTransferHandle(self, done)
 
     @torch.no_grad()
     def start_weight_sync(
@@ -522,12 +554,8 @@ class NcclP2PTransport(ReplicaWeightTransport):
             def accumulate(projection, index, contribution):
                 key = (projection, index)
                 if key not in accumulators:
-                    accumulators[key] = (
-                        native_grads[projection]
-                        .tensors[index]
-                        .view(-1)
-                        .to(dtype=torch.float32, copy=True)
-                    )
+                    native = native_grads[projection].tensors[index].view(-1)
+                    accumulators[key] = native if native.dtype == torch.float32 else native.float()
                 accumulators[key].add_(contribution.float())
 
             for projection in projections:
@@ -557,5 +585,6 @@ class NcclP2PTransport(ReplicaWeightTransport):
         self._inflight.clear()
         self._weights = self._columnwise_weights = self._replica_grads = self._native_grads = ()
         self._native_grad_storage = None
-        self._scales.clear()
+        self._scales = {}
+        self.workspace = None
         self._destroyed = True
