@@ -116,13 +116,15 @@ when a layer keeps an old handle for repeated waits.
 
 ## CUDA graphs and diagnostics
 
-An unset `--moe-expert-rank-capacity-factor` preserves HybridEP's dynamic,
-dropless dispatch for both transports. The scheduler does not imply a static
+An unset `--moe-expert-rank-capacity-factor` preserves dropless dispatch for both
+transports. ECHO/EPLB use HybridEP's dynamic output sizing. MoonEP supplies a
+per-invocation route bound; HybridEP adds per-expert alignment padding and checks
+that bound on-device, avoiding dynamic output sizing in eager execution. The scheduler does not imply a static
 capacity of 1.0: a planner can leave a rank above the mean token count, and
 per-expert padding can increase the required capacity further. Explicit static
 capacity remains supported and requires the training overflow retry path when
 the budget is exceeded. Capturing MoE requires an explicit static capacity;
-dynamic output sizing synchronizes with the host.
+the eager MoonEP bound does not relax that configuration restriction.
 
 The exact cache requires host decisions and cannot run inside a captured MoE
 region. Attention-only CUDA graphs remain supported. NCCL retains its existing
@@ -149,3 +151,32 @@ This is a paired production-path diagnostic, not an independent mathematical
 reference. A separate insufficient-static-capacity control must report both
 dispatch overflow and numerical disagreement. The six cases pass per rank;
 dynamic-capacity forward and input gradients match exactly in this recipe.
+
+
+## Module boundaries
+
+`MoEScheduler` owns the training-facing prepare, step, logical-load, and export
+operations. Planners provide logical export placements through `MoELoadPlanner`;
+training code never interprets committed or pending planner layouts. Home dispatch
+has its own typed contract because it stages `HomeExpertPlacement`, unlike replica
+dispatch's Tensor placement. It owns installation health and terminal export.
+Replica dispatch binds the borrowed transport and optimizer adapter without
+exposing its runtime to scheduler orchestration.
+
+Optimizer leaves expose `get_parameter_state_binding`,
+`defer_param_sync_for_state_update`, and `refresh_model_weights`. Bucket maps,
+master-to-compute casts, and FSDP shard offsets remain owned by optimizer/FSDP.
+The home adapter receives source parameters and transport configuration, not the
+whole replica runtime. Expert modules own runtime detachment and fused-op cleanup.
+Scheduler diagnostics use module loggers at INFO level, following application
+logging configuration; they do not print directly to stdout.
+
+
+The 2026-09-29 boundary refactor passed the release-contract suite on four
+Lyris GB200 GPUs: 42 passed and one EP8 case skipped per rank. This includes
+learned padding/autograd, distributed MoonEP routing, logical checkpoint load
+and export with Adam continuation, failed-install protection, module logging,
+optimizer hold release, parameter bindings, and configuration capacity checks.
+The run used the approved ARM experimental TE image, not the official CI image.
+The complete home-exchange, BF16 parity, and DataLoader RNG files were not rerun
+in this validation; full FSDP/MXFP8 training remains outside this result.

@@ -14,6 +14,8 @@ from megatron.core.transformer.moe.replica_weight_transport import (
     ReplicaTransportConfig,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class ReplicaConsumerFence:
     """Serialize runtime consumers, including shared native-gradient staging.
@@ -103,9 +105,7 @@ class ReplicaWeightCache:
         if layout not in self._reported_layouts:
             self._reported_layouts.add(layout)
             if dist.get_rank(self.group) == 0:
-                logging.getLogger(__name__).info(
-                    "Replica weight cache hit: layout=%s; prefetch skipped", layout.value
-                )
+                logger.info("Replica weight cache hit: layout=%s; prefetch skipped", layout.value)
         return entry.handle
 
     def remember(self, layout, placement, sources, handle):

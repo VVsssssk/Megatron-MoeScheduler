@@ -340,6 +340,13 @@ class TEGroupedMLP(MegatronModule):
             raise RuntimeError("Replica weights must be bound before the first expert forward.")
         self._replica_expert_runtime = runtime
 
+    def release_replica_expert_runtime(self, runtime) -> None:
+        """Detach fused compute references only from the runtime that owns them."""
+        if self._replica_expert_runtime is not runtime:
+            raise RuntimeError("Cannot release a replica runtime owned by another layer.")
+        self._fused_ops = None
+        self._replica_expert_runtime = None
+
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
@@ -677,9 +684,7 @@ class TEGroupedMLP(MegatronModule):
             self.prepare_fused_impl_parameters()
             self._fused_impl_parameters_prepared = False
             if self._replica_expert_runtime is not None:
-                self._replica_expert_runtime.wait_prefetch(
-                    self._replica_expert_runtime.last_plan
-                )
+                self._replica_expert_runtime.wait_prefetch(self._replica_expert_runtime.last_plan)
                 self._replica_expert_runtime.consume_forward_source_weights()
 
         return forward_pre_hook
@@ -1025,9 +1030,7 @@ class TEGroupedMLP(MegatronModule):
                 num_global_experts = _num_checkpoint_global_experts(
                     self, num_local_checkpoint_experts
                 )
-                local_expert_indices_offset = (
-                    self.ep_group.rank() * num_local_checkpoint_experts
-                )
+                local_expert_indices_offset = self.ep_group.rank() * num_local_checkpoint_experts
                 ep_axis = len(sharded_offsets)
                 for i in range(num_local_checkpoint_experts):
                     if singleton_local_shards:

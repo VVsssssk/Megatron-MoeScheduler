@@ -104,7 +104,9 @@ def test_deferred_home_cycles_preserve_adam_continuation(ep_group):
     runtime = SimpleNamespace(source_parameters=tuple(physical), transport=transport)
     home = HomeExpertDispatch()
     home.bind_transport(transport)
-    home.bind_state_adapter(OptimizerHomeExpertState(optim, runtime))
+    home.bind_state_adapter(
+        OptimizerHomeExpertState(optim, runtime.source_parameters, runtime.transport.config)
+    )
     addresses = [p.data_ptr() for p in physical]
     logical_home = torch.arange(e, device=device)
     version = 0
@@ -385,7 +387,7 @@ def test_mcore_optimizer_storage_and_continuation(distributed_world, recipe):
     )
     ref_optim = torch.optim.Adam(reference, lr=0.001)
     runtime = SimpleNamespace(source_parameters=parameters, transport=transport)
-    state = OptimizerHomeExpertState(optimizer, runtime)
+    state = OptimizerHomeExpertState(optimizer, runtime.source_parameters, runtime.transport.config)
     home = HomeExpertDispatch()
     home.bind_transport(transport)
     home.bind_state_adapter(state)
@@ -412,7 +414,7 @@ def test_mcore_optimizer_storage_and_continuation(distributed_world, recipe):
             if step == 0:
                 home.dispatch(None, HomeExpertPlacement(permutation, 1), None)
                 for leaf in optimizer_leaves(optimizer):
-                    leaf._home_exchange_defer_param_sync = True
+                    leaf.defer_param_sync_for_state_update(True)
             success, _, _ = optimizer.step()
             assert success
             ref_optim.step()

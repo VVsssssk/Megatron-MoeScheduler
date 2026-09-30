@@ -11,14 +11,24 @@ trades temporary memory/communication for a simple first implementation.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 
+from megatron.core.optimizer.optimizer import OptimizerStateBinding
 
-def optimizer_leaves(optimizer):
+if TYPE_CHECKING:
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+    from megatron.core.optimizer.optimizer_config import OptimizerConfig
+    from megatron.core.transformer.moe.replica_weight_transport import ReplicaTransportConfig
+
+
+def optimizer_leaves(
+    optimizer: MegatronOptimizer | torch.optim.Optimizer,
+) -> list[MegatronOptimizer | torch.optim.Optimizer]:
     """Return leaf Megatron optimizers without depending on a particular wrapper."""
     children = getattr(optimizer, "chained_optimizers", None)
     if children is None:
@@ -26,7 +36,7 @@ def optimizer_leaves(optimizer):
     return [leaf for child in children for leaf in optimizer_leaves(child)]
 
 
-def validate_home_expert_optimizer_config(config: Any) -> None:
+def validate_home_expert_optimizer_config(config: OptimizerConfig | None) -> None:
     """Reject unsupported state representations before constructing an optimizer."""
     if getattr(config, "optimizer", "adam") not in ("adam", "sgd"):
         raise ValueError("Home exchange currently supports Adam and SGD optimizer state only.")
@@ -43,7 +53,7 @@ def validate_home_expert_optimizer_config(config: Any) -> None:
         raise ValueError("Home exchange needs resident uncompressed optimizer state.")
 
 
-def _local(tensor):
+def _local(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to_local() if hasattr(tensor, "to_local") else tensor
 
 
@@ -65,14 +75,20 @@ class ShardedHomeExpertState:
     No Parameter, optimizer tensor or bucket view is replaced during install.
     """
 
-    def __init__(self, components, *, device, dp_group=None):
+    def __init__(
+        self,
+        components: Callable[[], dict[str, list[HomeStateShard]]],
+        *,
+        device: torch.device,
+        dp_group: dist.ProcessGroup | None = None,
+    ) -> None:
         self.components = components
         self.device = device
         self.dp_group = dp_group
         self._destinations = None
 
     @torch.no_grad()
-    def snapshot(self):
+    def snapshot(self) -> tuple[torch.Tensor, ...]:
         components = self.components()
         names = sorted(components)
         self.component_names = tuple(names)
@@ -127,7 +143,7 @@ class ShardedHomeExpertState:
         return tuple(sources)
 
     @torch.no_grad()
-    def install(self, received):
+    def install(self, received: Sequence[torch.Tensor]) -> None:
         if self._destinations is None or len(received) != len(self._destinations):
             raise RuntimeError("Home state installation has no matching snapshot.")
         for source, shards in zip(received, self._destinations):
@@ -151,12 +167,17 @@ class OptimizerHomeExpertState(ShardedHomeExpertState):
     path after all home layers have migrated.
     """
 
-    def __init__(self, optimizer, runtime):
-        self.runtime = runtime
+    def __init__(
+        self,
+        optimizer: MegatronOptimizer | torch.optim.Optimizer,
+        source_parameters: Sequence[torch.Tensor],
+        transport_config: ReplicaTransportConfig,
+    ) -> None:
+        self.transport_config = transport_config
         self.leaves = optimizer_leaves(optimizer)
-        self._bindings = []
+        self._bindings: list[OptimizerStateBinding] = []
         dp_group = None
-        for parameter in runtime.source_parameters:
+        for parameter in source_parameters:
             binding = self._find_binding(parameter)
             self._bindings.append(binding)
             group = binding[3]
@@ -164,70 +185,26 @@ class OptimizerHomeExpertState(ShardedHomeExpertState):
                 if dp_group is not None and group is not dp_group:
                     raise ValueError("One home layer cannot span different optimizer shard groups.")
                 dp_group = group
-        super().__init__(
-            self._components, device=runtime.transport.config.device, dp_group=dp_group
-        )
+        super().__init__(self._components, device=transport_config.device, dp_group=dp_group)
         # Check group options and any restored tensor-state schema now. Lazy
         # Adam/SGD moments may be absent until the first successful update.
         self._components()
 
-    def _find_binding(self, parameter):
+    def _find_binding(self, parameter: torch.Tensor) -> OptimizerStateBinding:
         for leaf in self.leaves:
             config = getattr(leaf, "config", None)
             validate_home_expert_optimizer_config(config)
-            if getattr(leaf, "_optimizer_state_offloader", None) is not None:
-                raise NotImplementedError(
-                    "Home exchange needs resident uncompressed optimizer state."
-                )
-            optim = (
-                leaf
-                if isinstance(leaf, torch.optim.Optimizer)
-                else getattr(leaf, "optimizer", None)
-            )
-            if optim is None:
-                continue
-            for group in optim.param_groups:
-                for main in group["params"]:
-                    if getattr(main, "orig_param", None) is parameter:
-                        # FSDP exposes the real main-weight buffer's slice. The
-                        # model-weight slice can differ for quantized parameters.
-                        chunks = getattr(leaf, "model_chunks", ())
-                        for chunk in chunks:
-                            buffer = chunk.param_and_grad_buffer
-                            if parameter not in buffer.param_to_param_group:
-                                continue
-                            pg = buffer.parameter_groups[buffer.param_to_param_group[parameter]]
-                            weight = pg.main_weight_buffer or pg.model_weight_buffer
-                            sharded = (
-                                buffer.bucketing_policy.data_parallel_sharding_strategy
-                                != "no_shard"
-                            )
-                            start = 0
-                            if sharded:
-                                item = weight.param_idx[parameter]
-                                start, _ = weight._get_item_slice_in_shard(item)
-                            dp = buffer.dist_index.get_dp_group(
-                                is_expert_parallel=pg.is_expert_param
-                            )
-                            return optim, main, start, dp if sharded else None
-                        raise ValueError("Cannot locate FSDP authoritative home weight buffer.")
-            param_map = getattr(leaf, "model_param_gbuf_map", {})
-            if parameter in param_map or any(
-                parameter in buffer.param_index_map for buffer in getattr(leaf, "buffers", ())
-            ):
-                index = leaf.model_param_group_index_map.get(parameter)
-                if index is None:
-                    return optim, None, 0, leaf.data_parallel_group
-                main = optim.param_groups[index[0]]["params"][index[1]]
-                start = leaf._get_model_param_range_map(parameter)["param"].start
-                return optim, main, start, leaf.data_parallel_group
-            main = getattr(parameter, "main_param", parameter)
-            if any(p is main for group in optim.param_groups for p in group["params"]):
-                return optim, main, 0, None
+            if isinstance(leaf, torch.optim.Optimizer):
+                if any(p is parameter for group in leaf.param_groups for p in group["params"]):
+                    return OptimizerStateBinding(leaf, parameter, 0, None)
+            else:
+                binding = leaf.get_parameter_state_binding(parameter)
+                if binding is not None:
+                    return binding
         raise ValueError("Native expert is not owned by a supported optimizer state adapter.")
 
-    def _components(self):
-        h = self.runtime.transport.config.num_local_home_experts
+    def _components(self) -> dict[str, list[HomeStateShard]]:
+        h = self.transport_config.num_local_home_experts
         steps = []
         for optim, main, _, _ in self._bindings:
             if main is not None and "step" in optim.state[main]:
@@ -235,7 +212,7 @@ class OptimizerHomeExpertState(ShardedHomeExpertState):
                 steps.append(step.item() if isinstance(step, torch.Tensor) else step)
         # MCore assumes one common optimizer step. Verify it before leaving the
         # scalar in its fixed slot, including replicated and sharded optimizers.
-        for group in (self.dp_group, self.runtime.transport.config.group):
+        for group in (self.dp_group, self.transport_config.group):
             if group is not None:
                 gathered_steps = [None] * dist.get_world_size(group)
                 dist.all_gather_object(gathered_steps, steps, group=group)
@@ -269,7 +246,7 @@ class OptimizerHomeExpertState(ShardedHomeExpertState):
                 if (value := group.get(key)) is not None
             }
             options[index // h].append((type(optim).__module__, type(optim).__name__, values))
-        for group in (self.dp_group, self.runtime.transport.config.group):
+        for group in (self.dp_group, self.transport_config.group):
             if group is not None:
                 gathered_options = [None] * dist.get_world_size(group)
                 dist.all_gather_object(gathered_options, options, group=group)
@@ -289,7 +266,7 @@ class OptimizerHomeExpertState(ShardedHomeExpertState):
                     "Home experts must have identical optimizer options within each projection."
                 )
         components = {}
-        for projection, shape in enumerate(self.runtime.transport.config.member_shapes):
+        for projection, shape in enumerate(self.transport_config.member_shapes):
             bindings = self._bindings[projection * h : (projection + 1) * h]
             # Missing shards still join schema discovery. State values are read
             # here, AFTER optimizer.step, rather than when the plan was staged.

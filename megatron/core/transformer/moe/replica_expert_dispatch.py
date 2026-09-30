@@ -7,13 +7,19 @@ from __future__ import annotations
 import functools
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import torch
 
 from megatron.core.transformer.moe.moe_scheduler import ExpertDispatch, SchedulerContext
 from megatron.core.transformer.moe.replica_expert_runtime import ReplicaExpertRuntime, ReplicaPlan
 from megatron.core.transformer.moe.replica_weight_transport import create_replica_weight_transport
+
+if TYPE_CHECKING:
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.moe.home_expert_dispatch import HomeExpertDispatch
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
@@ -26,7 +32,7 @@ class _ReplicaPlanSlot:
     """Stable placement storage retained through one forward/backward lifetime."""
 
     experts_to_copy: torch.Tensor
-    plan: Optional[ReplicaPlan] = None
+    plan: ReplicaPlan | None = None
     in_use: bool = False
     lifetime_tracked: bool = False
 
@@ -128,7 +134,7 @@ class ReplicaExpertDispatch(ExpertDispatch):
 
     dispatcher_name = "replica"
 
-    def __init__(self, *, config, pg_collection) -> None:
+    def __init__(self, *, config: TransformerConfig, pg_collection: ProcessGroupCollection) -> None:
         super().__init__()
         self.config = config
         self.dispatcher_name = str(config.moe_scheduler_expert_dispatcher_type)
@@ -139,10 +145,10 @@ class ReplicaExpertDispatch(ExpertDispatch):
         self.num_local_home_experts = self.num_experts // self.ep_size
         self.num_local_replica_slots = self.num_replica_slots // self.ep_size
         self.num_local_runtime_experts = self.num_local_home_experts + self.num_local_replica_slots
-        self.runtime: Optional[ReplicaExpertRuntime] = None
+        self.runtime: ReplicaExpertRuntime | None = None
         self._plan_slots: list[_ReplicaPlanSlot] = []
-        self._active_plan_slot: Optional[_ReplicaPlanSlot] = None
-        self._active_plan: Optional[ReplicaPlan] = None
+        self._active_plan_slot: _ReplicaPlanSlot | None = None
+        self._active_plan: ReplicaPlan | None = None
         self._forward_context = None
         self._placement_version = 0
 
@@ -165,6 +171,26 @@ class ReplicaExpertDispatch(ExpertDispatch):
             replica_mxfp8_storage=self.config.moe_scheduler_replica_mxfp8_storage,
         )
         experts.set_replica_expert_runtime(self.runtime)
+
+    def bind_home_dispatch(self, home: HomeExpertDispatch) -> None:
+        """Share the transport while keeping runtime details inside this backend."""
+        if self.runtime is None:
+            raise RuntimeError("Replica experts must be bound before home dispatch.")
+        home.bind_transport(self.runtime.transport)
+
+    def bind_home_optimizer(
+        self, home: HomeExpertDispatch, optimizer: MegatronOptimizer | torch.optim.Optimizer
+    ) -> None:
+        """Bind the optimizer adapter to this backend's native source parameters."""
+        from megatron.core.transformer.moe.home_expert_state import OptimizerHomeExpertState
+
+        if self.runtime is None:
+            raise RuntimeError("Replica experts must be bound before the optimizer.")
+        home.bind_state_adapter(
+            OptimizerHomeExpertState(
+                optimizer, self.runtime.source_parameters, self.runtime.transport.config
+            )
+        )
 
     def assert_idle(self) -> None:
         """Reject home mutation while any microbatch can still use the old weights."""

@@ -457,6 +457,7 @@ def test_nccl_replica_scheduler_rejects_moe_capture(impl, scopes):
     with pytest.raises(ValueError, match="replica_nccl host schedules"):
         _scheduler_config(
             moe_scheduler_expert_dispatcher_type="replica_nccl",
+            moe_expert_rank_capacity_factor=1.0,
             cuda_graph_impl=impl,
             cuda_graph_modules=scopes,
         )
@@ -467,6 +468,7 @@ def test_replica_token_dispatcher_config_preserves_outer_moe_capture(planner):
     config = _scheduler_config(
         moe_scheduler_planner_type=planner,
         moe_scheduler_num_idle_experts=4,
+        moe_expert_rank_capacity_factor=1.0,
         cuda_graph_impl="transformer_engine",
         cuda_graph_modules=["attn", "moe"],
     )

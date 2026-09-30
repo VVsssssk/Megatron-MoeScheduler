@@ -41,8 +41,8 @@ package "Scheduler contract" {
     + ep_rank: int
     + router_topk: int
     + training: bool
-    + config: Any
-    + pg_collection: Any
+    + config: TransformerConfig | None
+    + pg_collection: ProcessGroupCollection | None
   }
 
   class MoEPlacementResult <<opaque>>
@@ -70,6 +70,8 @@ package "Scheduler contract" {
     + planner: MoELoadPlanner
     + home_expert_dispatch: Optional[HomeExpertDispatch]
     + bind_optimizer(optimizer)
+    + prepare_home_exchange()
+    + canonicalize_home_for_export()
     + step()
     + expert_dispatch: ExpertDispatch
     {static} + from_config(config, pg_collection): MoEScheduler
@@ -264,13 +266,15 @@ class HomeExpertDispatch {
   - state_adapter: OptimizerHomeExpertState
   + dispatch(experts, placement, context)
   + step(): Optional[int]
+  + assert_healthy()
+  + assert_ready()
+  + export_placement(placement)
 }
 class HomeExpertPlacement {
   + source_slots: Tensor [EP, H]
   + version: int
 }
 MoEScheduler o-- HomeExpertDispatch
-ExpertDispatch <|-- HomeExpertDispatch
 HomeExpertDispatch --> ReplicaWeightTransport
 HomeExpertDispatch --> OptimizerHomeExpertState
 EPLBLoadPlanner --> HomeExpertPlacement

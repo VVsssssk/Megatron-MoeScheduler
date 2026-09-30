@@ -295,19 +295,22 @@ Current constraints:
 - `num_moe_experts` and `moe_scheduler_num_idle_experts` must be divisible by
   the expert-model-parallel size.
 - `add_bias_linear` must be disabled.
-- The `replica_peer_tma` expert dispatcher requires discrete native expert
+- Both replica expert dispatchers require discrete native expert
   weights and the Transformer Engine operation fuser; single grouped expert
   weights are unsupported.
 - The HybridEP flex token dispatcher requires a build with HybridEP support.
 - The MoonEP planner requires CUDA, initialized EP distributed groups, and one
   replica slot per local home expert. Its current #6892 planner uses one fused
   cooperative kernel and an NCCL symmetric-memory histogram window.
-- The EPLB planner currently uses the current step's EP-global token counts and
-  global placement rather than a historical moving-average load predictor or
-  hierarchical multi-node expert-group placement.
-- CUDA graph capture is supported only at the whole-MoE scope for
-  `replica_peer_tma`; separate `moe_router` and `moe_preprocess` scopes are
-  rejected. MoE activation recompute is also rejected for this lifecycle.
+- EPLB uses the current invocation's EP-global token counts for replica placement
+  with fixed homes. With home migration enabled, it accumulates loads over the
+  update interval and commits proposed homes after a successful optimizer step.
+  Hierarchical multi-node expert-group placement is not implemented.
+- MoE CUDA graph capture requires `replica_peer_tma`, an explicit
+  `moe_expert_rank_capacity_factor`, and a storage policy without exact weight
+  caching (shared storage, or MXFP8 layerwise storage with `reuse`). Separate
+  `moe_router` and `moe_preprocess` scopes are rejected. Attention-only capture
+  is allowed for both transports and all storage policies. MoE activation recompute is also rejected for this lifecycle.
   The physical-expert token-dispatcher config does not own graph capture;
   it clears its layer-level graph policy while the enclosing logical MoE
   layer retains the requested capture scopes. Dispatcher kernels execute

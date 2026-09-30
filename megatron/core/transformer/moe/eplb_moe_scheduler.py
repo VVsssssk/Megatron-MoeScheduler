@@ -245,7 +245,16 @@ class EPLBLoadPlanner(MoELoadPlanner):
         """Restore required planner serialization after all model-load retries."""
         self._loading_logical_checkpoint = False
 
-    def step(self, completed_version=None):
+    def logical_export_placement(self) -> HomeExpertPlacement | None:
+        """Invert only committed ownership; pending plans do not own any weights."""
+        if not self.active_home_layout.numel():
+            return None
+        sources = torch.argsort(self.active_home_layout.flatten()).reshape_as(
+            self.active_home_layout
+        )
+        return HomeExpertPlacement(sources, 1)
+
+    def step(self, completed_version: int | None = None) -> None:
         """Publish new logical ownership only after the dispatcher completed exchange."""
         if completed_version is not None:
             if completed_version != self._pending_version:

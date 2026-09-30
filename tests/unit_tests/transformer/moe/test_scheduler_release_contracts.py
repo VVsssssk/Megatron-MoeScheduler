@@ -10,7 +10,10 @@ import torch.distributed as dist
 
 from megatron.core.transformer.moe.eplb_moe_scheduler import EPLBLoadPlanner
 from megatron.core.transformer.moe.home_expert_dispatch import HomeExpertDispatch
-from megatron.core.transformer.moe.home_expert_state import validate_home_expert_optimizer_config
+from megatron.core.transformer.moe.home_expert_state import (
+    OptimizerHomeExpertState,
+    validate_home_expert_optimizer_config,
+)
 from megatron.core.transformer.moe.home_expert_training import (
     canonicalize_home_experts_for_export,
     finish_home_expert_checkpoint_load,
@@ -167,6 +170,13 @@ class _BoundDispatch(ExpertDispatch):
     def __init__(self, runtime=None):
         super().__init__()
         self.runtime = runtime
+
+    def bind_home_optimizer(self, home, optimizer):
+        home.bind_state_adapter(
+            OptimizerHomeExpertState(
+                optimizer, self.runtime.source_parameters, self.runtime.transport.config
+            )
+        )
 
     def dispatch(self, experts, expert_placement, context):
         raise AssertionError("Checkpoint initialization/export must not run replica dispatch.")
@@ -351,3 +361,74 @@ def test_export_restores_logical_weights_and_adam_state(ep_group, tmp_path):
                 )
     finally:
         transport.destroy()
+
+
+def test_failed_installation_blocks_checkpoint_and_export():
+    model = _planner_model(EPLBLoadPlanner(2, 1))
+    # Reproduce the fatal state set by a failed install; consumers must use the
+    # dispatcher contract rather than interpreting its internal flag.
+    model.moe_scheduler.home_expert_dispatch._failed = True
+    with pytest.raises(RuntimeError, match="installation failed"):
+        model.state_dict()
+    with pytest.raises(RuntimeError, match="installation failed"):
+        model.moe_scheduler.canonicalize_home_for_export()
+
+
+def test_scheduler_logging_uses_module_logger(caplog, monkeypatch):
+    import logging
+
+    from megatron.core.transformer.moe import moe_scheduler
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    with caplog.at_level(logging.INFO, logger=moe_scheduler.__name__):
+        moe_scheduler._rank0_info("scheduler diagnostic")
+    assert [(record.name, record.message) for record in caplog.records] == [
+        (moe_scheduler.__name__, "scheduler diagnostic")
+    ]
+
+
+@pytest.mark.parametrize("successful", [False, True])
+def test_home_boundary_releases_hold_and_refreshes_only_after_success(successful, monkeypatch):
+    from megatron.core.optimizer.optimizer import FP32Optimizer
+    from megatron.core.transformer.moe.home_expert_training import finish_home_expert_step
+
+    parameter = torch.nn.Parameter(torch.ones(1))
+    optimizer = FP32Optimizer(
+        torch.optim.SGD([parameter], lr=0.1), SimpleNamespace(), lambda _: None
+    )
+    events = []
+    optimizer.defer_param_sync_for_state_update(True)
+    monkeypatch.setattr(optimizer, "refresh_model_weights", lambda: events.append("refresh"))
+    scheduler = SimpleNamespace(step=lambda: events.append("migrate"))
+    finish_home_expert_step([scheduler], optimizer, successful)
+    assert events == (["migrate", "refresh"] if successful else [])
+    assert not optimizer.param_sync_deferred_for_state_update
+
+
+@pytest.mark.parametrize("planner", ["echo", "eplb", "moon_ep"])
+def test_documented_moe_capture_capacity_boundary(planner):
+    options = dict(
+        moe_scheduler_planner_type=planner,
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=["moe"],
+    )
+    with pytest.raises(ValueError, match="requires an explicit"):
+        _scheduler_config(**options)
+    config = _scheduler_config(**options, moe_expert_rank_capacity_factor=1.0)
+    assert config.moe_expert_rank_capacity_factor == 1.0
+
+
+def test_optimizer_binding_preserves_master_identity_and_rejects_unowned_parameter():
+    from megatron.core.optimizer.optimizer import FP32Optimizer
+    from megatron.core.optimizer.optimizer_config import OptimizerConfig
+
+    parameter = torch.nn.Parameter(torch.ones(3, device="cuda"))
+    unowned = torch.nn.Parameter(torch.zeros_like(parameter))
+    inner = torch.optim.Adam([parameter])
+    optimizer = FP32Optimizer(inner, OptimizerConfig(), lambda _: None)
+    binding = optimizer.get_parameter_state_binding(parameter)
+    assert binding.optimizer is inner
+    assert binding.main is parameter and binding.start == 0 and binding.group is None
+    assert optimizer.get_parameter_state_binding(unowned) is None
+    optimizer.refresh_model_weights(force=True)
+    assert inner.param_groups[0]["params"][0] is parameter

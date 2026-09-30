@@ -8,7 +8,7 @@ import math
 import warnings
 from abc import ABC, abstractmethod
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from typing_extensions import override
@@ -131,6 +131,20 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
 
 
+class OptimizerStateBinding(NamedTuple):
+    """Writable optimizer parameter and offset in the complete model parameter.
+
+    A missing local shard still carries its DP group so collective consumers
+    can reconstruct the complete state. None means this optimizer does not
+    own the model parameter when returned by ``get_parameter_state_binding``.
+    """
+
+    optimizer: torch.optim.Optimizer
+    main: torch.Tensor | None
+    start: int
+    group: torch.distributed.ProcessGroup | None
+
+
 class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
@@ -168,6 +182,37 @@ class MegatronOptimizer(ABC):
         self._optimizer_state_offloader: ChunkedOptimizerStateOffloader | None = None
         self._defer_optimizer_state_prefetch_to_step = False
         self._defer_optimizer_master_offload_for_param_sync = False
+
+    def get_parameter_state_binding(self, parameter: torch.Tensor) -> OptimizerStateBinding | None:
+        """Resolve resident authoritative storage for an externally updated parameter."""
+        if self._optimizer_state_offloader is not None:
+            raise NotImplementedError("External state updates require resident optimizer state.")
+        if self.optimizer is None:
+            return None
+        main = getattr(parameter, 'main_param', parameter)
+        if any(p is main for group in self.optimizer.param_groups for p in group['params']):
+            return OptimizerStateBinding(self.optimizer, main, 0, None)
+        return None
+
+    @property
+    def param_sync_deferred_for_state_update(self) -> bool:
+        """Whether a drained external state update owns the next parameter gather."""
+        return getattr(self, '_param_sync_deferred_for_state_update', False)
+
+    def defer_param_sync_for_state_update(self, deferred: bool) -> None:
+        """Hold/release eager gathers while authoritative optimizer state is moved.
+
+        The caller must drain gradient consumers before enabling the hold and
+        refresh model weights before releasing it after a successful update.
+        """
+        self._param_sync_deferred_for_state_update = deferred
+
+    def refresh_model_weights(self, *, force: bool = False) -> None:
+        """Rebuild compute weights from authoritative state; FP32 aliases need no copy.
+
+        ``force`` also stages weights normally rebuilt by an overlapping gather,
+        as required for a synchronous checkpoint export.
+        """
 
     def enable_chunked_optimizer_state_offload(
         self,
@@ -847,6 +892,18 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             return found_inf_flag
 
         return False
+
+    @torch.no_grad()
+    def refresh_model_weights(self, *, force: bool = False) -> None:
+        """Regenerate compute weights using this optimizer's cast and buffer layout."""
+        if self.is_stub_optimizer:
+            return
+        fsdp = getattr(getattr(self, 'ddp_config', None), 'use_megatron_fsdp', False)
+        if self.config.reuse_grad_buf_for_mxfp8_param_ag and not fsdp:
+            if force or not self.config.overlap_param_gather:
+                self._copy_main_params_to_param_buffer()
+        else:
+            self._copy_main_params_to_model_params()
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
@@ -1800,7 +1857,7 @@ class ChainedOptimizer(MegatronOptimizer):
             if (
                 self.config.overlap_param_gather_with_optimizer_step
                 and optimizer_idx == 0
-                and not getattr(optimizer, "_home_exchange_defer_param_sync", False)
+                and not optimizer.param_sync_deferred_for_state_update
             ):
                 assert success
                 assert len(optimizer.model_chunks) == 1
@@ -1896,10 +1953,7 @@ class ChainedOptimizer(MegatronOptimizer):
         if (
             success
             and deferred_bucket_groups
-            and not any(
-                getattr(opt, "_home_exchange_defer_param_sync", False)
-                for opt in self.chained_optimizers
-            )
+            and not any(opt.param_sync_deferred_for_state_update for opt in self.chained_optimizers)
         ):
             self._start_deferred_mxfp8_param_sync(deferred_bucket_groups)
 

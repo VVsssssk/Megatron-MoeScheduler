@@ -2,16 +2,24 @@
 
 """Training-loop integration for the explicit MoEScheduler.step boundary."""
 
+from __future__ import annotations
+
+from argparse import Namespace
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING
 
 import torch
 
 from megatron.core.transformer.moe.home_expert_state import optimizer_leaves
 from megatron.core.transformer.moe.moe_scheduler import MoEScheduler
 
+if TYPE_CHECKING:
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
 
-def validate_home_expert_checkpoint_args(args: Any, checkpoint_args: Any = None) -> None:
+
+def validate_home_expert_checkpoint_args(
+    args: Namespace, checkpoint_args: Namespace | None = None
+) -> None:
     """Reject formats or topology changes that lose physical expert ownership."""
     active = getattr(args, "moe_scheduler_home_update_interval", 0)
     saved = getattr(checkpoint_args, "moe_scheduler_home_update_interval", 0)
@@ -57,7 +65,9 @@ def home_expert_schedulers(model: Sequence[torch.nn.Module]) -> list[MoESchedule
     ]
 
 
-def initialize_home_expert_optimizers(model: Sequence[torch.nn.Module], optimizer: Any) -> None:
+def initialize_home_expert_optimizers(
+    model: Sequence[torch.nn.Module], optimizer: MegatronOptimizer | torch.optim.Optimizer
+) -> None:
     """Resolve authoritative optimizer bindings during initialization, before training."""
     for scheduler in home_expert_schedulers(model):
         if optimizer is None:
@@ -66,7 +76,7 @@ def initialize_home_expert_optimizers(model: Sequence[torch.nn.Module], optimize
 
 
 def prepare_home_expert_checkpoint_load(
-    args: Any, model: Sequence[torch.nn.Module], checkpoint_args: Any
+    args: Namespace, model: Sequence[torch.nn.Module], checkpoint_args: Namespace
 ) -> bool:
     """Select strict resume or identity-owned initialization before building load templates."""
     active = getattr(args, "moe_scheduler_home_update_interval", 0)
@@ -92,18 +102,20 @@ def prepare_home_expert_checkpoint_load(
         args.consumed_valid_samples = 0
         args.skipped_train_samples = 0
         for scheduler in home_expert_schedulers(model):
-            scheduler.planner.begin_logical_checkpoint_load()
+            scheduler.begin_logical_checkpoint_load()
     return fresh
 
 
 def finish_home_expert_checkpoint_load(model: Sequence[torch.nn.Module]) -> None:
     """End logical initialization after model tensors have finished loading."""
     for scheduler in home_expert_schedulers(model):
-        scheduler.planner.finish_logical_checkpoint_load()
+        scheduler.finish_logical_checkpoint_load()
 
 
 @torch.no_grad()
-def canonicalize_home_experts_for_export(model: Sequence[torch.nn.Module], optimizer: Any) -> None:
+def canonicalize_home_experts_for_export(
+    model: Sequence[torch.nn.Module], optimizer: MegatronOptimizer | torch.optim.Optimizer
+) -> None:
     """Restore logical expert order, including optimizer state, for conversion-only export.
 
     This is a terminal conversion operation. The caller saves with the scheduler
@@ -111,27 +123,12 @@ def canonicalize_home_experts_for_export(model: Sequence[torch.nn.Module], optim
     Deferred planner proposals are deliberately not executed: only committed
     home ownership determines where the loaded checkpoint's tensors reside.
     """
-    from megatron.core.transformer.moe.home_expert_dispatch import HomeExpertDispatch
-    from megatron.core.transformer.moe.replica_weight_transport import HomeExpertPlacement
-
     schedulers = home_expert_schedulers(model)
     if not schedulers or optimizer is None:
         raise ValueError("Logical export requires initialized home schedulers and an optimizer.")
     torch.cuda.synchronize()
     for scheduler in schedulers:
-        scheduler.expert_dispatch.assert_idle()
-        home = scheduler.home_expert_dispatch
-        if home.state_adapter is None or home._failed:
-            raise RuntimeError("Cannot export unbound or partially installed home state.")
-        layout = scheduler.planner.active_home_layout
-        if not layout.numel():
-            continue  # A checkpoint saved before its first forward has identity ownership.
-        canonical = torch.argsort(layout.flatten()).reshape_as(layout)
-        exporter = HomeExpertDispatch()
-        exporter.bind_transport(home.transport)
-        exporter.bind_state_adapter(home.state_adapter)
-        exporter.dispatch(None, HomeExpertPlacement(canonical, 1), None)
-        exporter.step()
+        scheduler.canonicalize_home_for_export()
 
     # Finish every layer's migration before rebuilding any shared gather buffer.
     leaves = optimizer_leaves(optimizer)
@@ -139,14 +136,8 @@ def canonicalize_home_experts_for_export(model: Sequence[torch.nn.Module], optim
     for chunk in chunks.values():
         chunk.zero_grad_buffer()
     for leaf in leaves:
-        if getattr(leaf, "is_stub_optimizer", False):
-            continue
-        if getattr(
-            getattr(leaf, "config", None), "reuse_grad_buf_for_mxfp8_param_ag", False
-        ) and not getattr(getattr(leaf, "ddp_config", None), "use_megatron_fsdp", False):
-            leaf._copy_main_params_to_param_buffer()
-        elif hasattr(leaf, "_copy_main_params_to_model_params"):
-            leaf._copy_main_params_to_model_params()
+        if not isinstance(leaf, torch.optim.Optimizer):
+            leaf.refresh_model_weights(force=True)
     for chunk in chunks.values():
         chunk.start_param_sync(force_sync=True)
     torch.cuda.synchronize()
@@ -163,7 +154,7 @@ def canonicalize_home_experts_for_export(model: Sequence[torch.nn.Module], optim
 
 
 @torch.no_grad()
-def restore_home_expert_checkpoint_weights(optimizer):
+def restore_home_expert_checkpoint_weights(optimizer: MegatronOptimizer) -> None:
     """Rebuild both MXFP8 orientations from restored optimizer master weights.
 
     A dequantized rowwise checkpoint cannot reconstruct the independent
@@ -182,37 +173,38 @@ def restore_home_expert_checkpoint_weights(optimizer):
     for chunk in chunks.values():
         chunk.zero_grad_buffer()
     for leaf in leaves:
-        leaf._copy_main_params_to_param_buffer()
+        leaf.refresh_model_weights(force=True)
     for chunk in chunks.values():
         chunk.start_param_sync(force_sync=True)
 
 
-def prepare_home_expert_step(model, optimizer):
+def prepare_home_expert_step(
+    model: Sequence[torch.nn.Module], optimizer: MegatronOptimizer
+) -> list[MoEScheduler]:
     """Drain old work and defer parameter gathers if any layer has a pending plan.
 
     Returns the schedulers that need a successful-step notification. This is
     intentionally training-loop glue, not a combined expert dispatch component.
     """
     schedulers = home_expert_schedulers(model)
-    if any(s.home_expert_dispatch.has_pending for s in schedulers):
+    if any(s.has_pending_home_exchange for s in schedulers):
         for scheduler in schedulers:
-            scheduler.expert_dispatch.assert_idle()
-            home = scheduler.home_expert_dispatch
-            if home.state_adapter is None:
-                raise RuntimeError("Home optimizer bindings must be initialized before training.")
+            scheduler.prepare_home_exchange()
         # First version uses a device fence at rare migration boundaries. It
         # includes FSDP/replica reduction streams and previous gather consumers.
         torch.cuda.synchronize()
         for leaf in optimizer_leaves(optimizer):
-            leaf._home_exchange_defer_param_sync = True
+            leaf.defer_param_sync_for_state_update(True)
     return schedulers
 
 
 @torch.no_grad()
-def finish_home_expert_step(schedulers, optimizer, update_successful):
+def finish_home_expert_step(
+    schedulers: Sequence[MoEScheduler], optimizer: MegatronOptimizer, update_successful: bool
+) -> None:
     """Migrate updated state and commit mappings before restarting gathers."""
     leaves = optimizer_leaves(optimizer)
-    deferred = any(getattr(leaf, "_home_exchange_defer_param_sync", False) for leaf in leaves)
+    deferred = any(leaf.param_sync_deferred_for_state_update for leaf in leaves)
     if update_successful:
         for scheduler in schedulers:
             scheduler.step()
@@ -220,16 +212,9 @@ def finish_home_expert_step(schedulers, optimizer, update_successful):
             # All layers migrate before copying/casting model weights. Existing
             # DDP/FSDP/MXFP8 code owns every destination wrapper and scale layout.
             for leaf in leaves:
-                if getattr(leaf, "is_stub_optimizer", False):
-                    continue
-                config = getattr(leaf, "config", None)
-                if getattr(config, "reuse_grad_buf_for_mxfp8_param_ag", False):
-                    if not config.overlap_param_gather:
-                        leaf._copy_main_params_to_param_buffer()
-                elif hasattr(leaf, "_copy_main_params_to_model_params"):
-                    leaf._copy_main_params_to_model_params()
+                leaf.refresh_model_weights()
     for leaf in leaves:
-        leaf._home_exchange_defer_param_sync = False
+        leaf.defer_param_sync_for_state_update(False)
     if deferred and update_successful:
         chunks = {}
         for leaf in leaves:

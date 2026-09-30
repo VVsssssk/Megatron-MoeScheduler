@@ -937,8 +937,7 @@ class ReplicaExpertRuntime:
             return
         experts = self._experts_ref()
         if experts is not None:
-            experts._fused_ops = None
-            experts._replica_expert_runtime = None
+            experts.release_replica_expert_runtime(self)
         for projection in self.projections:
             projection.destroy()
         self.projections.clear()

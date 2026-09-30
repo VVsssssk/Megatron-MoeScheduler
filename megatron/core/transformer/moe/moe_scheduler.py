@@ -18,10 +18,11 @@ Concrete expert dispatchers consume physical source-slot tables, never logical m
 
 from __future__ import annotations
 
+import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, ClassVar, Optional
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -30,13 +31,23 @@ from megatron.core.transformer.moe.replica_weight_transport import (
     HomeExpertPlacement,
 )
 
+if TYPE_CHECKING:
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.moe.home_expert_dispatch import HomeExpertDispatch
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+logger = logging.getLogger(__name__)
+
 ECHO_BACKEND = "echo"
 EPLB_BACKEND = "eplb"
 ULTRA_EP_BACKEND = "ultra_ep"
 MOON_EP_BACKEND = "moon_ep"
 
 
-def validate_scheduler_environment(config: Any, pg_collection: Any) -> None:
+def validate_scheduler_environment(
+    config: TransformerConfig, pg_collection: ProcessGroupCollection
+) -> None:
     """Check execution dependencies before allocating a layer's expert weights."""
     if not torch.cuda.is_available():
         raise RuntimeError("MoEScheduler requires CUDA.")
@@ -95,10 +106,10 @@ def _rank0_info(message: str) -> None:
     except RuntimeError:
         is_rank0 = True
     if is_rank0:
-        print(f"INFO:MoEScheduler: {message}", flush=True)
+        logger.info("%s", message)
 
 
-def _tensor_shape(tensor: Optional[torch.Tensor]) -> Optional[tuple[int, ...]]:
+def _tensor_shape(tensor: torch.Tensor | None) -> tuple[int, ...] | None:
     return None if tensor is None else tuple(tensor.shape)
 
 
@@ -111,7 +122,7 @@ def _validate_2d_tensor(name: str, tensor: torch.Tensor) -> None:
 class SchedulerContext:
     """Static and per-forward context shared by planners and dispatchers."""
 
-    layer_number: Optional[int]
+    layer_number: int | None
     num_logical_experts: int
     num_local_experts: int
     local_expert_indices: tuple[int, ...]
@@ -119,8 +130,8 @@ class SchedulerContext:
     ep_rank: int
     router_topk: int
     training: bool
-    config: Any = None
-    pg_collection: Any = None
+    config: TransformerConfig | None = None
+    pg_collection: ProcessGroupCollection | None = None
 
     def __post_init__(self) -> None:
         if self.num_logical_experts <= 0:
@@ -152,7 +163,7 @@ class MoEPlacementResult:
     integer. It excludes per-expert transport padding. None makes no promise.
     """
 
-    max_dispatch_routes_per_rank: Optional[int] = None
+    max_dispatch_routes_per_rank: int | None = None
 
 
 def _validate_reroute_output(
@@ -186,14 +197,26 @@ class MoELoadPlanner(torch.nn.Module, ABC):
         routing_map: torch.Tensor,
         context: SchedulerContext,
         *,
-        tokens_per_expert: Optional[torch.Tensor] = None,
-    ) -> tuple[Optional[HomeExpertPlacement], Optional[torch.Tensor], MoEPlacementResult]:
+        tokens_per_expert: torch.Tensor | None = None,
+    ) -> tuple[HomeExpertPlacement | None, torch.Tensor | None, MoEPlacementResult]:
         """Return optional home exchange, replica copies, and private reroute state."""
 
-    def step(self, completed_version: Optional[int] = None) -> None:
+    def step(self, completed_version: int | None = None) -> None:
         """Commit completed home placement after a successful optimizer update."""
         if completed_version is not None:
             raise RuntimeError("This planner has no pending home exchange.")
+
+    def begin_logical_checkpoint_load(self) -> None:
+        """Select identity-owned initialization, if supported by this planner."""
+        raise NotImplementedError(f"{self.planner_name} does not support home checkpoints.")
+
+    def finish_logical_checkpoint_load(self) -> None:
+        """Finish identity-owned initialization after checkpoint loading."""
+        raise NotImplementedError(f"{self.planner_name} does not support home checkpoints.")
+
+    def logical_export_placement(self) -> HomeExpertPlacement | None:
+        """Return physical sources restoring logical order, ignoring pending proposals."""
+        raise NotImplementedError(f"{self.planner_name} does not support logical export.")
 
     @abstractmethod
     def reroute(
@@ -233,6 +256,16 @@ class ExpertDispatch(torch.nn.Module, ABC):
         """Bind expert parameters for dispatchers that own persistent runtime weights."""
         del experts
 
+    def bind_home_dispatch(self, home: HomeExpertDispatch) -> None:
+        """Provide a compatible transport after binding expert weights."""
+        raise NotImplementedError(f"{self.dispatcher_name} does not support home migration.")
+
+    def bind_home_optimizer(
+        self, home: HomeExpertDispatch, optimizer: MegatronOptimizer | torch.optim.Optimizer
+    ) -> None:
+        """Provide authoritative state without exposing dispatcher runtime internals."""
+        raise NotImplementedError(f"{self.dispatcher_name} does not support home migration.")
+
     def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Attach lifecycle work that must run after all layer-input consumers."""
         return hidden_states
@@ -264,16 +297,18 @@ class MoEScheduler(torch.nn.Module):
         self,
         planner: MoELoadPlanner,
         expert_dispatch: ExpertDispatch,
-        home_expert_dispatch: Optional[ExpertDispatch] = None,
+        home_expert_dispatch: HomeExpertDispatch | None = None,
     ) -> None:
         super().__init__()
         self.planner = planner
         self.expert_dispatch = expert_dispatch
         self.home_expert_dispatch = home_expert_dispatch
-        self.max_dispatch_routes_per_rank: Optional[int] = None
+        self.max_dispatch_routes_per_rank: int | None = None
 
     @classmethod
-    def from_config(cls, config: Any, pg_collection: Any) -> "MoEScheduler":
+    def from_config(
+        cls, config: TransformerConfig, pg_collection: ProcessGroupCollection
+    ) -> "MoEScheduler":
         """Build the configured MoEScheduler backend stack."""
         planner_type = getattr(config, "moe_scheduler_planner_type", None)
         expert_dispatcher_type = getattr(config, "moe_scheduler_expert_dispatcher_type", None)
@@ -353,11 +388,10 @@ class MoEScheduler(torch.nn.Module):
             )
         return state
 
-    def _check_checkpoint_boundary(self):
+    def _check_checkpoint_boundary(self) -> None:
         if self.home_expert_dispatch is not None:
             self.expert_dispatch.assert_idle()
-            if self.home_expert_dispatch._failed:
-                raise RuntimeError("Cannot checkpoint partially installed home expert state.")
+            self.home_expert_dispatch.assert_healthy()
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         self._check_checkpoint_boundary()
@@ -367,16 +401,40 @@ class MoEScheduler(torch.nn.Module):
         """Bind the layer's native experts to the configured dispatch backend."""
         self.expert_dispatch.bind_experts(experts)
         if self.home_expert_dispatch is not None:
-            self.home_expert_dispatch.bind_transport(self.expert_dispatch.runtime.transport)
+            self.expert_dispatch.bind_home_dispatch(self.home_expert_dispatch)
 
-    def bind_optimizer(self, optimizer) -> None:
+    def bind_optimizer(self, optimizer: MegatronOptimizer | torch.optim.Optimizer) -> None:
         """Bind authoritative state after DDP/FSDP and optimizer construction."""
         if self.home_expert_dispatch is not None:
-            from megatron.core.transformer.moe.home_expert_state import OptimizerHomeExpertState
+            self.expert_dispatch.bind_home_optimizer(self.home_expert_dispatch, optimizer)
 
-            self.home_expert_dispatch.bind_state_adapter(
-                OptimizerHomeExpertState(optimizer, self.expert_dispatch.runtime)
-            )
+    @property
+    def has_pending_home_exchange(self) -> bool:
+        """Whether the next successful update needs a migration window."""
+        return self.home_expert_dispatch is not None and self.home_expert_dispatch.has_pending
+
+    def prepare_home_exchange(self) -> None:
+        """Validate drained, bound home state before deferring optimizer gathers."""
+        self.expert_dispatch.assert_idle()
+        if self.home_expert_dispatch is not None:
+            self.home_expert_dispatch.assert_ready()
+
+    def begin_logical_checkpoint_load(self) -> None:
+        """Select logical-weight initialization through the planner contract."""
+        self.planner.begin_logical_checkpoint_load()
+
+    def finish_logical_checkpoint_load(self) -> None:
+        """Restore strict checkpoint requirements after logical initialization."""
+        self.planner.finish_logical_checkpoint_load()
+
+    def canonicalize_home_for_export(self) -> None:
+        """Restore committed homes without executing pending training proposals."""
+        self.prepare_home_exchange()
+        if self.home_expert_dispatch is None:
+            raise RuntimeError("Logical export requires home migration.")
+        placement = self.planner.logical_export_placement()
+        if placement is not None:
+            self.home_expert_dispatch.export_placement(placement)
 
     def step(self) -> None:
         """Migrate updated home state, then publish mapping, at a drained step boundary."""
@@ -429,7 +487,7 @@ class MoEScheduler(torch.nn.Module):
         experts: torch.nn.Module,
         context: SchedulerContext,
         *,
-        tokens_per_expert: Optional[torch.Tensor] = None,
+        tokens_per_expert: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Plan token/expert rerouting and materialize the expert side."""
         # Bounds belong to this invocation, never a previous placement/shape.
