@@ -2106,6 +2106,15 @@ def get_all_ranks():
 
 def destroy_model_parallel():
     """Set the groups to none."""
+    try:
+        from megatron.core.transformer.moe.replica_expert_runtime import (
+            finalize_replica_expert_runtimes,
+        )
+
+        finalize_replica_expert_runtimes()
+    except Exception:  # finalization must never block process-group teardown
+        pass
+
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
     # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.

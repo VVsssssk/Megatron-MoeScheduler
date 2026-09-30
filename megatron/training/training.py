@@ -2501,6 +2501,12 @@ def setup_model_and_optimizer(
             update_train_iters(args)
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
+        if getattr(args, "moe_scheduler_home_update_interval", 0):
+            from megatron.core.transformer.moe.home_expert_state import (
+                validate_home_expert_optimizer_config,
+            )
+
+            validate_home_expert_optimizer_config(config)
         config.timers = timers
         if getattr(args, "use_mup", False):
             model_config_source = (
@@ -2523,6 +2529,10 @@ def setup_model_and_optimizer(
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+
+    from megatron.core.transformer.moe.home_expert_training import initialize_home_expert_optimizers
+
+    initialize_home_expert_optimizers(model, optimizer)
 
     one_logger and one_logger.log_metrics(
         {"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()}
@@ -2642,7 +2652,23 @@ def setup_model_and_optimizer(
             optimizer.reload_model_params()
 
     # Convert checkpoint format.
+    # Checkpoint loading can replace optimizer tensors; bind their final storage
+    # before either the first training step or conversion-only home export.
+    initialize_home_expert_optimizers(model, optimizer)
     if args.ckpt_convert_format is not None:
+        if getattr(args, "moe_scheduler_export_logical_checkpoint", False):
+            from megatron.core.transformer.moe.home_expert_training import (
+                canonicalize_home_experts_for_export,
+            )
+
+            canonicalize_home_experts_for_export(model, optimizer)
+            args.moe_enable_scheduler = False
+            args.moe_scheduler_home_update_interval = 0
+            args.moe_scheduler_num_idle_experts = 0
+            args.moe_scheduler_export_logical_checkpoint = False
+            # Conversion exits immediately after save_checkpoint; complete the
+            # exported checkpoint synchronously before reaching that exit.
+            args.async_save = False
         load_ckpt_format = args.ckpt_format
         args.ckpt_format = args.ckpt_convert_format
         args.save = os.path.join(args.ckpt_convert_save, args.ckpt_convert_format)
@@ -2999,19 +3025,15 @@ def train_step(
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    from megatron.core.transformer.moe.home_expert_training import (
+        finish_home_expert_step,
+        prepare_home_expert_step,
+    )
+
+    home_schedulers = prepare_home_expert_step(model, optimizer)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
-    # get max attention logit for logging and run clip_qk()
-    # Part of MuonClip Optimizer step
-    log_max_attention_logit = 0
-    if args.qk_clip or args.log_max_attention_logit:
-        log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
-
     timers('optimizer').stop()
-
-    # Checkpoint params with parameter names.
-    if save_params_in_this_iteration:
-        _save_state_dict(attr_name="data", label="params")
 
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
     pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
@@ -3027,6 +3049,16 @@ def train_step(
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
     update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
+    finish_home_expert_step(home_schedulers, optimizer, update_successful)
+
+    # get max attention logit for logging and run clip_qk()
+    # Part of MuonClip Optimizer step
+    log_max_attention_logit = 0
+    if args.qk_clip or args.log_max_attention_logit:
+        log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
+
+    if save_params_in_this_iteration:
+        _save_state_dict(attr_name="data", label="params")
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
@@ -4810,7 +4842,7 @@ def evaluate(
             ft_integration.on_eval_step_start()
             if getattr(config, 'sequence_packing_scheduler', None) is not None:
                 try:
-                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                    packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
                         wrap_data_iterator(data_iterator, config, eval_num_microbatches)
                     )
                 except StopIteration:
@@ -5108,7 +5140,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     args = get_args()
 
-    (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
+    train_dataloader, valid_dataloaders, test_dataloader = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
 

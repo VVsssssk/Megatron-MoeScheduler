@@ -1,0 +1,353 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Learned routing, initialization, and logical-checkpoint release contracts."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.distributed as dist
+
+from megatron.core.transformer.moe.eplb_moe_scheduler import EPLBLoadPlanner
+from megatron.core.transformer.moe.home_expert_dispatch import HomeExpertDispatch
+from megatron.core.transformer.moe.home_expert_state import validate_home_expert_optimizer_config
+from megatron.core.transformer.moe.home_expert_training import (
+    canonicalize_home_experts_for_export,
+    finish_home_expert_checkpoint_load,
+    initialize_home_expert_optimizers,
+    prepare_home_expert_checkpoint_load,
+    validate_home_expert_checkpoint_args,
+)
+from megatron.core.transformer.moe.moe_scheduler import (
+    ExpertDispatch,
+    MoEScheduler,
+    SchedulerContext,
+    validate_scheduler_environment,
+)
+from megatron.core.transformer.moe.moonep_moe_scheduler import (
+    MoonEPLoadPlanner,
+    extract_semantic_routes,
+)
+from megatron.core.transformer.moe.replica_weight_transport import HomeExpertPlacement
+from tests.unit_tests.transformer.moe.test_echo_moe_scheduler import _scheduler_config
+from tests.unit_tests.transformer.moe.test_home_expert_exchange import (
+    _transport,
+    shared_checkpoint_dir,
+)
+from tests.unit_tests.transformer.moe.test_mock_router import _router
+from tests.unit_tests.transformer.moe.test_replica_nccl_transport import distributed_world, ep_group
+
+pytestmark = pytest.mark.launch_on_gb200
+
+
+@pytest.mark.parametrize("capacity", [None, 1.5])
+@pytest.mark.parametrize("padding", [[False] * 12, [True, False, False] * 4, [True] * 12])
+def test_learned_padding_preserves_topk_and_zero_gradients(capacity, padding):
+    router = _router("moon_ep", moe_expert_rank_capacity_factor=capacity)
+    router.mock_route_cache = None
+    router.config.moe_router_mock_maxvio = None
+    router.routing_type = "none"
+    router.expert_bias = router.router_replay = None
+    logits = torch.randn(12, 1, 8, device="cuda", requires_grad=True)
+    mask = torch.tensor(padding, device="cuda")
+    reference_probs, reference_routes = router.routing(logits)
+    probs, routes = router.routing(logits, padding_mask=mask)
+    assert (routes.sum(1) == router.topk).all()
+    torch.testing.assert_close(routes, reference_routes)
+    torch.testing.assert_close(probs[~mask], reference_probs[~mask])
+    assert not probs[mask].any()
+    _, ids = extract_semantic_routes(routes, probs, router.topk)
+    assert ((ids >= 0) & (ids < 8)).all()
+    (probs * torch.arange(8, device="cuda")).sum().backward()
+    assert not logits.grad[mask].any()
+
+
+def test_learned_padding_runs_distributed_moonep(distributed_world):
+    group = distributed_world
+    rank, size = dist.get_rank(group), dist.get_world_size(group)
+    experts = 2 * size
+    router = _router(
+        "moon_ep",
+        num_moe_experts=experts,
+        expert_model_parallel_size=size,
+        moe_router_mock_maxvio=1.0,
+    )
+    router.mock_route_cache = None
+    router.config.moe_router_mock_maxvio = None
+    router.routing_type = "none"
+    router.expert_bias = router.router_replay = None
+    logits = torch.randn(32, 1, experts, device="cuda", requires_grad=True)
+    # Same physical token count with different valid lengths, including an
+    # entirely padded rank. The planner still sees a full top-k on every rank.
+    mask = torch.arange(32, device="cuda") >= (0 if rank == 0 else 24 + rank % 8)
+    probs, routes = router.routing(logits, padding_mask=mask)
+    context = SchedulerContext(
+        1,
+        experts,
+        2,
+        (2 * rank, 2 * rank + 1),
+        size,
+        rank,
+        2,
+        True,
+        pg_collection=SimpleNamespace(ep=group),
+    )
+    planner = MoonEPLoadPlanner(2)
+    _, _, placement = planner.update_placement(probs, routes, context)
+    output_routes, output_probs = planner.reroute(probs, routes, placement, context)
+    assert (output_routes.sum(1) == 2).all()
+    torch.testing.assert_close(output_probs.sum(1), probs.sum(1))
+    assert not output_probs[mask].any()
+    output_probs.sum().backward()
+    assert not logits.grad[mask].any()
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"moe_scheduler_assignment_algorithm": "approx_bin_packing"}, "one_shot_greedy"),
+        ({"moe_scheduler_expert_dispatcher_type": "replica_hybridep"}, "not implemented"),
+        ({"expert_model_parallel_size": 128}, "at most 64"),
+        ({"moe_scheduler_planner_type": "moon_ep", "num_moe_experts": 16384}, "8192"),
+    ],
+)
+def test_algorithm_rejections_happen_in_config(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        _scheduler_config(**overrides)
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "optimizer_cpu_offload",
+        "use_precision_aware_optimizer",
+        "use_layer_wise_distributed_optimizer",
+        "chunked_optimizer_state_offload",
+        "offload_optimizer_states",
+    ],
+)
+def test_optimizer_representation_rejected_before_allocation(option):
+    with pytest.raises(ValueError, match="resident uncompressed"):
+        validate_home_expert_optimizer_config(SimpleNamespace(**{option: True}))
+
+
+def test_environment_rejects_missing_cuda_before_group_or_storage(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        validate_scheduler_environment(_scheduler_config(), None)
+
+
+def test_unsupported_optimizer_algorithm_rejected_before_allocation():
+    with pytest.raises(ValueError, match="Adam and SGD"):
+        validate_home_expert_optimizer_config(SimpleNamespace(optimizer="muon"))
+
+
+def _checkpoint_args(home=False):
+    return SimpleNamespace(
+        ckpt_format="torch_dist",
+        moe_enable_scheduler=home,
+        moe_scheduler_planner_type="eplb" if home else "echo",
+        moe_scheduler_home_update_interval=1 if home else 0,
+        moe_scheduler_num_idle_experts=2 if home else None,
+        num_experts=4,
+        expert_model_parallel_size=2,
+        expert_tensor_parallel_size=1,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        world_size=2,
+        finetune=False,
+        consumed_train_samples=99,
+        consumed_valid_samples=5,
+        skipped_train_samples=3,
+    )
+
+
+class _BoundDispatch(ExpertDispatch):
+    def __init__(self, runtime=None):
+        super().__init__()
+        self.runtime = runtime
+
+    def dispatch(self, experts, expert_placement, context):
+        raise AssertionError("Checkpoint initialization/export must not run replica dispatch.")
+
+
+def _planner_model(planner, runtime=None):
+    model = torch.nn.Module()
+    home = HomeExpertDispatch()
+    if runtime is not None:
+        home.bind_transport(runtime.transport)
+    model.moe_scheduler = MoEScheduler(planner, _BoundDispatch(runtime), home)
+    model.config = SimpleNamespace(moe_enable_scheduler=True, moe_scheduler_home_update_interval=1)
+    return model
+
+
+def test_logical_checkpoint_starts_fresh_and_waits_for_planner(monkeypatch):
+    planner = EPLBLoadPlanner(2, 1)
+    model = _planner_model(planner)
+    target, source = _checkpoint_args(True), _checkpoint_args(False)
+    assert prepare_home_expert_checkpoint_load(target, [model], source)
+    assert target.finetune
+    assert (
+        target.consumed_train_samples
+        == target.consumed_valid_samples
+        == target.skipped_train_samples
+        == 0
+    )
+    assert model.state_dict() == {}  # No unavailable planner object in the load template.
+    model.load_state_dict({}, strict=True)
+    # The generic training loader can retry for legacy TE extra-state keys.
+    model.load_state_dict({}, strict=False)
+    finish_home_expert_checkpoint_load([model])
+    assert not planner._loading_logical_checkpoint
+    assert "moe_scheduler.planner._planner_state" in model.state_dict()
+    assert planner._steps == 0
+    assert not model.moe_scheduler.home_expert_dispatch.has_pending
+    context = SchedulerContext(1, 4, 2, (0, 1), 2, 0, 1, True)
+    counts = torch.tensor([[100, 80, 3, 1], [0, 0, 0, 0]])
+    monkeypatch.setattr(planner, "_get_count_matrix", lambda *a, **kw: counts)
+    routes = torch.eye(4, dtype=torch.bool)
+    first, _, _ = planner.update_placement(routes.float(), routes, context)
+    assert first is None
+    torch.testing.assert_close(planner.active_home_layout, torch.tensor([[0, 1], [2, 3]]))
+    model.moe_scheduler.step()
+    proposal, _, _ = planner.update_placement(routes.float(), routes, context)
+    assert proposal is not None
+    # Producing a proposal still leaves committed ownership untouched.
+    torch.testing.assert_close(planner.active_home_layout, torch.tensor([[0, 1], [2, 3]]))
+
+
+def test_missing_planner_state_is_not_treated_as_logical_initialization():
+    planner = EPLBLoadPlanner(2, 1)
+    model = _planner_model(planner)
+    assert not prepare_home_expert_checkpoint_load(
+        _checkpoint_args(True), [model], _checkpoint_args(True)
+    )
+    with pytest.raises(RuntimeError, match="Missing required"):
+        model.load_state_dict({}, strict=False)
+
+
+def test_distributed_logical_checkpoint_initialization(distributed_world, shared_checkpoint_dir):
+    from megatron.core import dist_checkpointing
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor
+
+    rank, size = dist.get_rank(), dist.get_world_size()
+    expected = torch.full((2, 3), float(rank + 1), device="cuda")
+    path = shared_checkpoint_dir / "logical-initialization"
+    if rank == 0:
+        path.mkdir()
+    dist.barrier()
+
+    def weight_shard(tensor):
+        return ShardedTensor.from_rank_offsets("weight", tensor, (0, rank, size))
+
+    source, target = _checkpoint_args(False), _checkpoint_args(True)
+    for args in (source, target):
+        args.world_size = args.expert_model_parallel_size = size
+        args.num_experts = 2 * size
+    dist_checkpointing.save({"args": source, "model": {"weight": weight_shard(expected)}}, path)
+    common = dist_checkpointing.load_common_state_dict(path)
+    planner = EPLBLoadPlanner(size, 1)
+    model = _planner_model(planner)
+    model.weight = torch.nn.Parameter(torch.zeros_like(expected))
+    assert prepare_home_expert_checkpoint_load(target, [model], common["args"])
+    template = {"weight": weight_shard(model.weight)}
+    template.update(planner.sharded_state_dict(prefix="moe_scheduler.planner."))
+    loaded = dist_checkpointing.load({"model": template}, path)
+    model.load_state_dict(loaded["model"], strict=True)
+    finish_home_expert_checkpoint_load([model])
+    torch.testing.assert_close(model.weight, expected, rtol=0, atol=0)
+    assert not planner.active_home_layout.numel()
+    assert not model.moe_scheduler.home_expert_dispatch.has_pending
+
+
+@pytest.mark.parametrize("home_source", [False, True])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "world_size",
+        "expert_model_parallel_size",
+        "tensor_model_parallel_size",
+        "pipeline_model_parallel_size",
+        "context_parallel_size",
+    ],
+)
+def test_home_loading_rejects_topology_changes(home_source, field):
+    target, source = _checkpoint_args(True), _checkpoint_args(home_source)
+    setattr(target, field, getattr(source, field) * 2)
+    with pytest.raises(ValueError, match=f"unchanged {field}"):
+        validate_home_expert_checkpoint_args(target, source)
+
+
+def test_export_restores_logical_weights_and_adam_state(ep_group, tmp_path):
+    transport = _transport(ep_group)
+    rank, size = dist.get_rank(ep_group), dist.get_world_size(ep_group)
+    device = transport.config.device
+    count = 2 * size
+    reference = [
+        torch.nn.Parameter(torch.full(shape, float(expert + 10 * projection + 1), device=device))
+        for projection, shape in enumerate(transport.config.member_shapes)
+        for expert in range(count)
+    ]
+    physical = [
+        torch.nn.Parameter(reference[p * count + rank * 2 + slot].detach().clone())
+        for p in range(2)
+        for slot in range(2)
+    ]
+    ref_optim = torch.optim.Adam(reference, lr=0.01)
+    optim = torch.optim.Adam(physical, lr=0.01)
+    for p in reference + physical:
+        p.grad = p.detach().square()
+    ref_optim.step()
+    optim.step()
+    runtime = SimpleNamespace(source_parameters=tuple(physical), transport=transport)
+    planner = EPLBLoadPlanner(size, 1)
+    layer = _planner_model(planner, runtime)
+    layer.weights = torch.nn.ParameterList(physical)
+    initialize_home_expert_optimizers([layer], optim)
+    home = layer.moe_scheduler.home_expert_dispatch
+    permutation = torch.arange(count, device=device).roll(1).reshape(size, 2)
+    try:
+        home.dispatch(None, HomeExpertPlacement(permutation, 1), None)
+        home.step()
+        planner.active_home_layout = permutation.clone()
+        # Export ignores a not-yet-committed proposal restored from a checkpoint.
+        planner._pending_home_layout = permutation.flip(1)
+        planner._pending_version = 2
+        canonicalize_home_experts_for_export([layer], optim)
+        assert layer.moe_scheduler is None
+        assert not layer.config.moe_enable_scheduler
+        assert all("planner" not in key and "scheduler" not in key for key in layer.state_dict())
+        for p in range(2):
+            for slot in range(2):
+                actual, expected = physical[p * 2 + slot], reference[p * count + rank * 2 + slot]
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                for key in ("exp_avg", "exp_avg_sq", "step"):
+                    torch.testing.assert_close(
+                        optim.state[actual][key], ref_optim.state[expected][key], rtol=0, atol=0
+                    )
+        # An ordinary scheduler-free model can load the exported parameter keys.
+        plain = torch.nn.Module()
+        plain.weights = torch.nn.ParameterList(
+            [torch.nn.Parameter(torch.empty_like(p)) for p in physical]
+        )
+        path = tmp_path / f"logical-rank-{dist.get_rank()}.pt"
+        torch.save({"model": layer.state_dict(), "optimizer": optim.state_dict()}, path)
+        restored = torch.load(path, weights_only=True)
+        plain.load_state_dict(restored["model"], strict=True)
+        plain_optim = torch.optim.Adam(plain.parameters(), lr=0.01)
+        plain_optim.load_state_dict(restored["optimizer"])
+        for p in reference + list(plain.parameters()):
+            p.grad = p.detach() * 0.3
+        ref_optim.step()
+        plain_optim.step()
+        for p in range(2):
+            for slot in range(2):
+                torch.testing.assert_close(
+                    plain.weights[p * 2 + slot],
+                    reference[p * count + rank * 2 + slot],
+                    rtol=0,
+                    atol=0,
+                )
+    finally:
+        transport.destroy()

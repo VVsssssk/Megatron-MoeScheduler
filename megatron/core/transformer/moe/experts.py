@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
@@ -77,6 +78,16 @@ from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 
 logger = logging.getLogger(__name__)
+
+
+def _num_checkpoint_global_experts(
+    module: torch.nn.Module, num_local_checkpoint_experts: int
+) -> int:
+    """Return the global logical expert count that should be persisted."""
+    config_num_experts = getattr(module.config, "num_moe_experts", None)
+    if getattr(module.config, "moe_enable_scheduler", False) and config_num_experts is not None:
+        return config_num_experts
+    return module.ep_group.size() * num_local_checkpoint_experts
 
 
 class GroupedLinearFc1Interface(Protocol):
@@ -170,6 +181,23 @@ class GroupedMLPSubmodules:
     """
 
 
+class _ReplicaFC2WgradStore:
+    """Start FC2 replica reduction immediately after TE enqueues its wgrad GEMM."""
+
+    context = None
+
+    def __init__(self, runtime) -> None:
+        self._runtime = runtime
+
+    @staticmethod
+    def delay_wgrad_compute() -> bool:
+        return True
+
+    def put(self, tensors, wgrad_gemm) -> None:
+        wgrad_gemm(*tensors)
+        self._runtime.start_fc2_grad_reduce()
+
+
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
@@ -198,6 +226,10 @@ class TEGroupedMLP(MegatronModule):
 
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
+
+        if self.config.moe_enable_scheduler:
+            # ReplicaExpertRuntime owns fused runtime wgrad staging.
+            os.environ.setdefault("NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP", "1")
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
@@ -280,6 +312,8 @@ class TEGroupedMLP(MegatronModule):
             ), "Fused GroupedMLP is not supported for this configuration."
         self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
+        self._replica_expert_runtime = None
+        self._fused_impl_parameters_prepared = False
         if (
             self.config.gated_linear_unit
             and self.config.moe_mlp_glu_interleave_size is not None
@@ -299,6 +333,12 @@ class TEGroupedMLP(MegatronModule):
             self.quantization_unpadding = Fp8Unpadding(
                 self.num_local_experts, align_size=align_size
             )
+
+    def set_replica_expert_runtime(self, runtime) -> None:
+        """Use runtime-owned native and replica weights for fused expert compute."""
+        if self._fused_ops is not None:
+            raise RuntimeError("Replica weights must be bound before the first expert forward.")
+        self._replica_expert_runtime = runtime
 
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
@@ -440,6 +480,19 @@ class TEGroupedMLP(MegatronModule):
                 for idx in range(linear.num_gemms):
                     op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
 
+        def register_replica_weights(
+            op: torch.nn.Module, runtime_weights: tuple[torch.nn.Parameter, ...]
+        ) -> None:
+            """Attach discrete native-plus-replica weights to a TE op shell."""
+            if len(runtime_weights) != op.num_groups:
+                raise ValueError(
+                    f"Expected {op.num_groups} replica runtime weights, got "
+                    f"{len(runtime_weights)}."
+                )
+            op.register_parameter("weight", None)
+            for idx, runtime_weight in enumerate(runtime_weights):
+                op.register_parameter(f"weight{idx}", runtime_weight)
+
         # Container for fusible ops
         ops = te.pytorch.ops.Sequential()
 
@@ -464,27 +517,36 @@ class TEGroupedMLP(MegatronModule):
         # for runs that enable it via overlap_dispatch_backward_with_experts_wgrad.
         fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
         fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
+        replica_runtime = self._replica_expert_runtime
+        replica_num_gemms = (
+            replica_runtime.num_runtime_experts if replica_runtime is not None else None
+        )
 
         # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
         # Using meta avoids allocating duplicate weights for the fused wrapper.
         op = te.pytorch.ops.GroupedLinear(
-            self.linear_fc1.num_gemms,
+            replica_num_gemms or self.linear_fc1.num_gemms,
             self.linear_fc1.in_features,
             self.linear_fc1.out_features,
             bias=self.linear_fc1.use_bias,
             device="meta",
             dtype=fc1_weight_dtype,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
-            single_grouped_weight=fc1_single_grouped_weight,
+            single_grouped_weight=(
+                False if replica_runtime is not None else fc1_single_grouped_weight
+            ),
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
         # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
-        register_grouped_linear_params(
-            op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
-        )
+        if replica_runtime is not None:
+            register_replica_weights(op, replica_runtime.runtime_fc1_weights)
+        else:
+            register_grouped_linear_params(
+                op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
+            )
         ops.append(op)
 
         # Activation and post-multiply probs (SwiGLU, clamped GeGLU, or SReLU).
@@ -569,23 +631,29 @@ class TEGroupedMLP(MegatronModule):
 
         # FC2
         op = te.pytorch.ops.GroupedLinear(
-            self.linear_fc2.num_gemms,
+            replica_num_gemms or self.linear_fc2.num_gemms,
             self.linear_fc2.in_features,
             self.linear_fc2.out_features,
             bias=self.linear_fc2.use_bias,
             device="meta",
             dtype=fc2_weight_dtype,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
-            single_grouped_weight=fc2_single_grouped_weight,
+            single_grouped_weight=(
+                False if replica_runtime is not None else fc2_single_grouped_weight
+            ),
             single_grouped_bias=fc2_single_grouped_bias,
             delay_wgrad_compute=fc2_delay_wgrad_compute,
         )
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
         # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
-        register_grouped_linear_params(
-            op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
-        )
+        if replica_runtime is not None:
+            register_replica_weights(op, replica_runtime.runtime_fc2_weights)
+            op.wgrad_store = _ReplicaFC2WgradStore(replica_runtime)
+        else:
+            register_grouped_linear_params(
+                op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
+            )
         ops.append(op)
 
         # Emulate submodule pre-forward hooks
@@ -606,18 +674,48 @@ class TEGroupedMLP(MegatronModule):
         """
 
         def forward_pre_hook(module, *_) -> None:
-            for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
-                for hook in submodule._forward_pre_hooks.values():
-                    # Assume that hook does not interact with input
-                    ret = hook(submodule, None)
-                    if ret is not None:
-                        raise RuntimeError(
-                            f"Applying a fused implementation for {self.__class__.__name__}, "
-                            f"but a {submodule.__class__.__name__} submodule "
-                            "has a pre-forward hook that modifies the input tensor."
-                        )
+            self.prepare_fused_impl_parameters()
+            self._fused_impl_parameters_prepared = False
+            if self._replica_expert_runtime is not None:
+                self._replica_expert_runtime.wait_prefetch(
+                    self._replica_expert_runtime.last_plan
+                )
+                self._replica_expert_runtime.consume_forward_source_weights()
 
         return forward_pre_hook
+
+    def prepare_fused_impl_parameters(self) -> None:
+        """Run fused-op parameter hooks before planner-side weight prefetch."""
+        if self._fused_impl_parameters_prepared:
+            return
+        for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
+            for hook in submodule._forward_pre_hooks.values():
+                ret = hook(submodule, None)
+                if ret is not None:
+                    raise RuntimeError(
+                        f"Applying a fused implementation for {self.__class__.__name__}, "
+                        f"but a {submodule.__class__.__name__} submodule pre-forward hook "
+                        "modifies the input tensor."
+                    )
+        self._ensure_main_grad_for_fused_impl()
+        self._fused_impl_parameters_prepared = True
+
+    @staticmethod
+    def _ensure_main_grad(linear_module: torch.nn.Module) -> None:
+        """Expose FSDP main_grad buffers required by TE fused wgrad accumulation."""
+        if not getattr(linear_module, "fuse_wgrad_accumulation", False):
+            return
+        for param in linear_module.parameters(recurse=False):
+            get_main_grad = getattr(param, "get_main_grad", None)
+            if get_main_grad is not None and getattr(param, "main_grad", None) is None:
+                param.main_grad = get_main_grad()
+            if hasattr(param, "overwrite_main_grad"):
+                param.overwrite_main_grad = True
+
+    def _ensure_main_grad_for_fused_impl(self) -> None:
+        """Expose wrapper parameter main_grad buffers before TE fused ops run."""
+        self._ensure_main_grad(self.linear_fc1)
+        self._ensure_main_grad(self.linear_fc2)
 
     def _make_fused_impl_post_forward_hook(self) -> Callable:
         """Forward submodule hooks to the fused output.
@@ -923,10 +1021,15 @@ class TEGroupedMLP(MegatronModule):
                 module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group
             )
             if name == 'linear_fc1' and self.config.gated_linear_unit:
-                num_global_experts = self.ep_group.size() * self.num_local_experts
-                local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
+                num_local_checkpoint_experts = self.num_local_experts
+                num_global_experts = _num_checkpoint_global_experts(
+                    self, num_local_checkpoint_experts
+                )
+                local_expert_indices_offset = (
+                    self.ep_group.rank() * num_local_checkpoint_experts
+                )
                 ep_axis = len(sharded_offsets)
-                for i in range(self.num_local_experts):
+                for i in range(num_local_checkpoint_experts):
                     if singleton_local_shards:
                         new_sharded_offsets = sharded_offsets
                     else:
@@ -1374,12 +1477,14 @@ class SequentialMLP(MegatronModule):
         metadata = ensure_metadata_has_dp_cp_group(metadata)
 
         sharded_state_dict = {}
-        num_global_experts = self.ep_group.size() * self.num_local_experts
-        local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
+        num_local_checkpoint_experts = self.num_local_experts
+        num_global_experts = _num_checkpoint_global_experts(self, num_local_checkpoint_experts)
+        local_expert_indices_offset = self.ep_group.rank() * num_local_checkpoint_experts
 
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
 
-        for expert_local_idx, expert in enumerate(self.local_experts):
+        for expert_local_idx in range(num_local_checkpoint_experts):
+            expert = self.local_experts[expert_local_idx]
             expert_global_idx = local_expert_indices_offset + expert_local_idx
             expert_state_dict_prefix = f'{prefix}local_experts.{expert_local_idx}.'
             if singleton_local_shards:
