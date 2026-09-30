@@ -2280,6 +2280,9 @@ def load_checkpoint(
             iteration=1,
         )
         state_dict["_model"] = model
+        # DCP only restores fields present in the load template. This counter
+        # is added by save_checkpoint rather than generate_state_dict.
+        state_dict["num_floating_point_operations_so_far"] = 0
         load_kwargs["sharded_state_dict"] = state_dict
 
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(

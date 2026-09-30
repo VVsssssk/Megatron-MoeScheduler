@@ -118,7 +118,10 @@ from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_logging import (
+    get_moe_metrics_tracker,
+    get_moe_overload_factor_tracker,
+)
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
@@ -3336,6 +3339,15 @@ def training_log(
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
+        if args.log_moe_overload_factor:
+            # All ranks must reduce and clear the tracker every step, including
+            # steps that do not print an iteration line to stdout.
+            moe_log_string += get_moe_overload_factor_tracker().report(
+                iteration=iteration,
+                writer=writer,
+                wandb_writer=wandb_writer,
+                per_layer_logging=args.moe_per_layer_logging,
+            )
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
