@@ -489,7 +489,8 @@ class MoELayer(BaseMoELayer):
         context = self._build_scheduler_context()
         probs, routing_map = self.moe_scheduler.schedule(probs, routing_map, self.experts, context)
         self.token_dispatcher.set_dispatch_route_bound(
-            self.moe_scheduler.max_dispatch_routes_per_rank
+            self.moe_scheduler.max_dispatch_routes_per_rank,
+            padded_tokens=self.moe_scheduler.max_dispatch_padded_tokens_per_rank,
         )
         return probs, routing_map
 

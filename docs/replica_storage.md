@@ -69,7 +69,8 @@ Peer TMA and NCCL P2P support two independent options:
 
 `shared` reuses replica weights, scales, and gradients among compatible layers
 on the same EP group/device. `layerwise` allocates private replica storage.
-Native-gradient staging follows its separate runtime sharing contract.
+Regular DDP native gradients alias persistent `main_grad` buffers. FSDP, GTP,
+and overwrite callers retain the separate native-gradient staging contract.
 `reuse` aliases rowwise and columnwise MXFP8 storage; `separate` retains both
 orientations. The second option has no effect on BF16 allocation.
 
@@ -118,8 +119,9 @@ when a layer keeps an old handle for repeated waits.
 
 An unset `--moe-expert-rank-capacity-factor` preserves dropless dispatch for both
 transports. ECHO/EPLB use HybridEP's dynamic output sizing. MoonEP supplies a
-per-invocation route bound; HybridEP adds per-expert alignment padding and checks
-that bound on-device, avoiding dynamic output sizing in eager execution. The scheduler does not imply a static
+per-invocation bound on padded rows; HybridEP consumes it without adding padding
+a second time and checks overflow on-device, avoiding dynamic output sizing in
+eager execution. The scheduler does not imply a static
 capacity of 1.0: a planner can leave a rank above the mean token count, and
 per-expert padding can increase the required capacity further. Explicit static
 capacity remains supported and requires the training overflow retry path when
@@ -180,3 +182,55 @@ optimizer hold release, parameter bindings, and configuration capacity checks.
 The run used the approved ARM experimental TE image, not the official CI image.
 The complete home-exchange, BF16 parity, and DataLoader RNG files were not rerun
 in this validation; full FSDP/MXFP8 training remains outside this result.
+
+
+## PR #7450 alignment (no scheduler-interface or GTP migration)
+
+The MoonEP kernels track PR #7450 at `242c8dbc63c17ec804f1e31974d3dec86e5ed56c`.
+The scheduler still calls `update_placement`, replica dispatch, then `reroute`.
+Placement and reroute remain separate launches and retain the dense routing IR.
+Consequently this branch does not claim the PR's fused planner/side-stream
+scheduling overhead or end-to-end training performance.
+
+Placement rounds each global logical expert count once into GEMM-aligned blocks
+(256 for the supported fused grouped MLP), balances these blocks, and assigns
+remainder blocks to lower ranks. Routes retain their source-rank/token order;
+conceptual padding occurs only at the logical expert's end. Real route totals
+can differ between destinations. This applies to BF16 as well as MXFP8.
+The 32-program planner handles up to two EP ranks per program. Reroute uses
+512-route sort/scan tiles and binary search while emitting the existing dense
+probabilities with autograd. Compiled launchers are cached by shape, dtype,
+alignment and input-pointer alignment. Token shape can change between eager
+invocations; each shape gets its own specialization and capacity.
+
+For R routes per source rank, P ranks, E logical experts and alignment A,
+`blocks = (P*R + min(E, P*R)*(A-1)) // A` and the padded capacity is
+`A * ceil(blocks/P)`. The optional padded-capacity metadata is independent of
+an unpadded route bound. Explicit user capacity and overflow-retry policy take
+precedence over both bounds. The existing explicit-capacity requirement for
+captured MoE remains in place.
+
+Peer-TMA pushes use the PR's TMA reads and coalesced uint64 peer stores for both
+weight bytes and quantization scales. Existing transport completion and consumer
+fences remain in force. Regular DDP natives accumulate directly into persistent
+`main_grad`; virtual slots are zeroed before each accumulating backward. The
+handoff triggers original parameter hooks without re-adding native gradients.
+Runtime leaves do not request dummy gradients from TE. Overwrite/FSDP/GTP callers
+retain staging; GTP gather/reduction behavior is unchanged. Native staging is
+still allocated by the transport for fallback compatibility.
+
+An unbound runtime can be destroyed without changing the expert layer's native
+fused ops. Detaching a runtime owned by another layer remains an error.
+
+The existing TE weighted squared-ReLU expert path is allowed by scheduler
+configuration, with `ScaledSReLU` checked during environment initialization.
+Quantile routing and upstream grouped-tensor/GTP API migration are outside this
+change. All comparisons use a common supported recipe, not the PR's GTP recipe.
+
+`test_moonep_pr7450_alignment.py` checks the pinned PR's independent CPU oracle,
+local EP33/64 layouts, real EP communication and graph replay.
+`test_moonep_pr7450_training.py` checks DDP accumulation and BF16/MXFP8 Adam
+updates with mock/learned routing and weighted squared-ReLU. Local EP64 simulation is
+not a 64-GPU collective test. The optional `test_moonep_pr7450_benchmark.py`
+requires the unmodified, hash-pinned PR kernel source and records both kernel-only
+and equivalent dense-output timings; it does not enforce noisy CI speed gates.

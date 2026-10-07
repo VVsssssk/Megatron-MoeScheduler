@@ -42,11 +42,6 @@ _MXFP8_COMPONENTS = (
 )
 
 
-def _discard_runtime_parameter_grad(parameter: torch.nn.Parameter) -> None:
-    """Drop TE's throwaway leaf grad after its fused wgrad reaches runtime staging."""
-    parameter.grad = None
-
-
 @dataclass(frozen=True, eq=False)
 class ReplicaPlan:
     """Transport-facing result of replica placement planning.
@@ -88,7 +83,9 @@ def _parameter_storage(parameter: torch.nn.Parameter) -> torch.Tensor:
     return rowwise_data if rowwise_data is not None else parameter.data
 
 
-def _bf16_ptrs(source: torch.Tensor, *, numel: int, device: torch.device, label: str) -> tuple[int]:
+def _bf16_ptrs(
+    source: torch.Tensor, *, numel: int, device: torch.device, label: str
+) -> tuple[int]:
     """Validate one BF16 runtime member and return its pointer signature."""
     if (
         source.dtype != torch.bfloat16
@@ -252,9 +249,9 @@ class _DirectionalBinding:
 class _ReplicaProjection:
     """One projection and its stable native/virtual runtime storage.
 
-    Expert backward writes native and replica wgrads into runtime-owned staging.
-    The replica reduction accumulates the virtual contributions into the native
-    staging, which is then handed to the optimizer parameters through autograd.
+    Regular DDP natives accumulate directly into persistent model main_grad.
+    Other callers retain native staging and publish it through autograd. Replica
+    partials are reduced into the selected native destination before handoff.
     """
 
     name: str
@@ -271,7 +268,8 @@ class _ReplicaProjection:
     columnwise_scale_shape: tuple[int, ...] | None
     virtual_weight: tuple[torch.Tensor, ...]
     virtual_grad: torch.Tensor
-    native_grad: torch.Tensor
+    native_grad: torch.Tensor | tuple[torch.Tensor, ...]
+    accumulates_main_grad: bool = False
     runtime_parameters: tuple[torch.nn.Parameter, ...] | None = None
     source_storage_ptrs: tuple[tuple[int, ...], ...] | None = None
     native_grad_ptrs: tuple[int, ...] | None = None
@@ -425,6 +423,23 @@ class _ReplicaProjection:
                         )
                         table.copy_(host_row, non_blocking=not storage_changed)
 
+        # Regular DDP exposes persistent, accumulating main_grad buffers. GTP,
+        # FSDP and overwrite callers retain the established staging path.
+        direct = self.gtp_leader is None and all(
+            getattr(p, "main_grad", None) is not None
+            and hasattr(p, "grad_added_to_main_grad")
+            and not getattr(p, "__fsdp_param__", False)
+            and not getattr(p, "overwrite_main_grad", False)
+            for p in self.parameters
+        )
+        if self.runtime_parameters is None:
+            self.accumulates_main_grad = direct
+        elif direct != self.accumulates_main_grad:
+            raise RuntimeError(
+                "Replica native gradient accumulation policy changed after binding."
+            )
+        if self.accumulates_main_grad:
+            self.native_grad = tuple(p.main_grad.view(self.member_shape) for p in self.parameters)
         native_grads = tuple(self.native_grad)
         for index, grad in enumerate(native_grads):
             if (
@@ -471,11 +486,9 @@ class _ReplicaProjection:
             runtime_weight = weight.data if self.weight_format == "bf16" else weight
             parameter = torch.nn.Parameter(runtime_weight, requires_grad=True)
             parameter.main_grad = grad
-            parameter.grad_added_to_main_grad = True
-            # TE's wgrad GEMM then rewrites the staging and every replica slot
-            # on each backward, so the slots never need clearing.
-            parameter.overwrite_main_grad = True
-            parameter.register_post_accumulate_grad_hook(_discard_runtime_parameter_grad)
+            # These runtime leaves have no DDP hooks. Without grad_added_to_main_grad,
+            # TE returns None instead of allocating a dummy leaf gradient.
+            parameter.overwrite_main_grad = not self.accumulates_main_grad
             runtime_parameters.append(parameter)
         self.runtime_parameters = tuple(runtime_parameters)
 
@@ -497,8 +510,7 @@ class _ReplicaProjection:
                     f"Replica expert runtime {self.name} runtime main-grad storage changed after "
                     "binding."
                 )
-            parameter.grad_added_to_main_grad = True
-            parameter.overwrite_main_grad = True
+            parameter.overwrite_main_grad = not self.accumulates_main_grad
 
     def destroy(self) -> None:
         for parameter in self.runtime_parameters or ():
@@ -592,7 +604,8 @@ class ReplicaExpertRuntime:
         self._workspace_acquired = False
         self.weight_cache = (
             ReplicaWeightCache(self.group, self.device)
-            if replica_storage == "layerwise" and (not mxfp8 or replica_mxfp8_storage == "separate")
+            if replica_storage == "layerwise"
+            and (not mxfp8 or replica_mxfp8_storage == "separate")
             else None
         )
 
@@ -861,6 +874,11 @@ class ReplicaExpertRuntime:
         """Wait for the backward push and bind its plan to expert backward."""
         self.wait_prefetch(plan)
         self.consume_source_weights(_WeightDirection.BACKWARD)
+        # TE uses the native accumulation policy for the whole grouped GEMM.
+        # Virtual slots are scratch for this backward, never microbatch accumulators.
+        for projection in self.projections:
+            if projection.accumulates_main_grad:
+                projection.virtual_grad.zero_()
         self._backward_plan = plan
 
     def start_backward_prefetch(self, plan: ReplicaPlan) -> None:

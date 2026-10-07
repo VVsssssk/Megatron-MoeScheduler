@@ -21,8 +21,8 @@ Ordering between the transport and the expert GEMMs that read or write the
 symmetric arenas is stream order on each rank plus the collectives already in
 the layer: the planner's histogram all-gather precedes every owner push, and the
 reduction's device-side rendezvous brackets every gradient exchange. The
-replica gradient slots are never cleared; the runtime parameters carry
-``overwrite_main_grad`` so TE's wgrad GEMM rewrites them on every backward.
+replica gradient slots are cleared before accumulating DDP backward. Staging
+callers use ``overwrite_main_grad`` so TE rewrites their slots each backward.
 """
 
 import functools
@@ -41,7 +41,7 @@ MAX_REPLICA_EP_RANKS = 64
 # A tiled TMA descriptor caps its innermost box dimension at 256 elements, so a
 # flat stream is addressed as ``[rows, _ROW]``. Every transport offset is a
 # multiple of the tile size and therefore already row aligned. The push moves
-# opaque bytes and so views a row as 256 bytes; the reduction has to do
+# opaque bytes through uint64 words; the reduction has to do
 # arithmetic and views it as 256 gradient elements.
 _ROW = tl.constexpr(256)
 # Measured on GB300 at 32 SMs: 32 KiB tiles over four pipeline stages sustain the
@@ -183,7 +183,9 @@ def _plan_replica_placement_kernel(
             ranks[None, :] == destination, moved, tl.where(ranks[None, :] == rank, -moved, 0)
         )
         allocations += tl.where((local_experts[:, None] == local_expert) & active, transfer, 0)
-        remaining = tl.where(active & (local_experts == local_expert), remaining - moved, remaining)
+        remaining = tl.where(
+            active & (local_experts == local_expert), remaining - moved, remaining
+        )
         quotas = tl.where(active & (ranks == destination), quotas - moved, quotas)
     tl.store(
         expert_rank_allocations + native_experts[:, None] * EP_SIZE + ranks[None, :],
@@ -254,7 +256,9 @@ def _rank_routes_within_experts_kernel(
         route_positions = route_start + tile_offsets
         valid_routes = route_positions < partition_end
         route_experts = tl.load(
-            flat_topk_indices + route_positions, mask=valid_routes, other=NUM_EXPERTS + tile_offsets
+            flat_topk_indices + route_positions,
+            mask=valid_routes,
+            other=NUM_EXPERTS + tile_offsets,
         ).to(tl.int32)
         ranks_in_tile = tl.inline_asm_elementwise(
             asm="""
@@ -644,42 +648,40 @@ def _push_projection(
     NUM_LOCAL_REPLICA_SLOTS: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
-    """Push this block's share of one component into every replica slot.
+    """Push this block's share of one component into every virtual-expert slot.
 
-    Both descriptors span a whole member and stay fixed across the tile loop.
-    That is a requirement, not a convenience: Triton cannot predicate a descriptor
-    construction, so one built inside the pipelined loop would refuse to compile.
+    TMA reads feed coalesced uint64 stores to the peer without converting BF16/MXFP8
+    bytes. Build the source descriptor outside the pipeline: Triton cannot predicate
+    descriptor construction. Four stages balance bandwidth and shared-memory use.
     """
-    ROWS: tl.constexpr = MEMBER_BYTES // _ROW
-    TILE_ROWS: tl.constexpr = TILE_BYTES // _ROW
+    ROW: tl.constexpr = min(_ROW, TILE_BYTES // 8)
+    ROWS: tl.constexpr = MEMBER_BYTES // 8 // ROW
+    TILE_ROWS: tl.constexpr = TILE_BYTES // 8 // ROW
     TILES: tl.constexpr = ROWS // TILE_ROWS
-    # Cut each replica into as many segments as it takes to occupy the grid, and
-    # give every block one contiguous run. Striping every replica across every
-    # block instead would refill the copy pipeline once per replica, which costs
+    # Cut each virtual-expert into as many segments as it takes to occupy the grid, and
+    # give every block one contiguous run. Striping every virtual-expert across every
+    # block instead would refill the copy pipeline once per virtual-expert, which costs
     # more than it saves once a member is small - as the MXFP8 scales are.
     segments = tl.maximum(NUM_SMS // tl.maximum(active, 1), 1)
     for unit in tl.range(block, active * segments, NUM_SMS, num_stages=1):
-        # Vary the replica fastest. Consecutive replicas have different
+        # Vary the virtual-expert fastest. Consecutive virtual experts have different
         # destinations, so this keeps the blocks running at any instant spread
         # over the peers instead of queued behind the one peer being swept.
-        replica = unit % active
+        virtual_expert = unit % active
         segment = unit // active
-        chosen = tl.sum(tl.where(mine & (ordinal == replica), entry, 0), 0)
+        chosen = tl.sum(tl.where(mine & (ordinal == virtual_expert), entry, 0), 0)
         destination = chosen // NUM_LOCAL_REPLICA_SLOTS
         slot = (chosen - destination * NUM_LOCAL_REPLICA_SLOTS).to(tl.int64)
         expert = tl.load(plan + chosen) - rank * NUM_LOCAL_HOME_EXPERTS
         arena = tl.load(peer_bases.to(tl.pointer_type(tl.int64)) + destination)
         source = tl.make_tensor_descriptor(
-            tl.load(bases + expert).to(tl.pointer_type(tl.uint8)),
-            [ROWS, _ROW],
-            [_ROW, 1],
-            [TILE_ROWS, _ROW],
+            tl.load(bases + expert).to(tl.pointer_type(tl.uint64)),
+            [ROWS, ROW],
+            [ROW, 1],
+            [TILE_ROWS, ROW],
         )
-        replica_slot = tl.make_tensor_descriptor(
-            (arena + ARENA_BYTES + slot * MEMBER_BYTES).to(tl.pointer_type(tl.uint8)),
-            [ROWS, _ROW],
-            [_ROW, 1],
-            [TILE_ROWS, _ROW],
+        destination_base = tl.multiple_of(arena + ARENA_BYTES + slot * MEMBER_BYTES, 16).to(
+            tl.pointer_type(tl.uint64)
         )
         for tile in tl.range(
             segment * TILES // segments,
@@ -688,7 +690,11 @@ def _push_projection(
             num_stages=_NUM_STAGES,
         ):
             row = tile * TILE_ROWS
-            replica_slot.store([row, 0], source.load([row, 0]))
+            values = source.load([row, 0])
+            offsets = (row + tl.arange(0, TILE_ROWS)[:, None]).to(tl.int64) * ROW + tl.arange(
+                0, ROW
+            )[None, :]
+            tl.store(destination_base + offsets, values)
 
 
 # ``rank`` must not be specialized: Triton would otherwise compile a separate
@@ -884,7 +890,6 @@ def _replica_grad_reduce_kernel(
     slots on the next backward.
     """
     FC1_TILES: tl.constexpr = FC1_ROWS // TILE_ROWS
-    TILES: tl.constexpr = FC1_TILES + FC2_ROWS // TILE_ROWS
     PLAN_ENTRIES: tl.constexpr = WORLD * NUM_LOCAL_REPLICA_SLOTS
     FC2_BASE_ROW: tl.constexpr = NUM_LOCAL_REPLICA_SLOTS * FC1_ROWS
     ARENA_ROWS: tl.constexpr = NUM_LOCAL_REPLICA_SLOTS * (FC1_ROWS + FC2_ROWS)
@@ -956,11 +961,13 @@ def _replica_grad_reduce_kernel(
             # written only on the last: a load inside a conditional is one the
             # pipeliner will not prefetch, and seeding the accumulator with it
             # keeps the summation order ``native + s0 + s1 + ...``.
-            offset = tl.arange(0, TILE_ROWS)[None, :, None].to(tl.int64) * _ROW + tl.arange(0, _ROW)
-            staged = tl.load(native + offset).to(tl.float32)
-            partial = tl.where(index == 0, staged, partial) + window.load([destination, row, 0]).to(
-                tl.float32
+            offset = tl.arange(0, TILE_ROWS)[None, :, None].to(tl.int64) * _ROW + tl.arange(
+                0, _ROW
             )
+            staged = tl.load(native + offset).to(tl.float32)
+            partial = tl.where(index == 0, staged, partial) + window.load(
+                [destination, row, 0]
+            ).to(tl.float32)
             tl.store(native + offset, partial.to(arena.dtype.element_ty), mask=index == count - 1)
     _cross_rank_barrier(
         signal_bases, grid_barrier, dummy_signal, rank, WORLD, WORLD_POW2, NUM_SMS, THREADS
@@ -1207,9 +1214,7 @@ def compile_replica_weight_kernels(
                 plan,
                 0,
                 grid=(num_sms,),
-                **_grad_arguments(
-                    member_numels, grad_dtype, projections=projections, **shape
-                ),
+                **_grad_arguments(member_numels, grad_dtype, projections=projections, **shape),
             )
 
 
@@ -1281,11 +1286,12 @@ def launch_replica_grad_reduce(
     num_sms: int,
     projections: tuple[int, ...] = (0, 1),
 ) -> None:
-    """Accumulate every peer's replica gradients into native wgrad staging.
+    """Accumulate every peer's replica gradients into the selected native buffers.
 
-    ``native_grads`` are ``int64`` pointer tables with one FC1 or FC2 staging
+    ``native_grads`` are ``int64`` pointer tables with one FC1 or FC2 gradient
     base per local expert; ``projections`` selects which projection this launch
-    reduces. Used replica slots are overwritten by the next wgrad GEMM.
+    reduces. Before the next GEMM, replica slots are cleared for accumulating
+    DDP callers or overwritten by staging callers.
     """
     _validate_transport_shape(world_size, num_local_home_experts, num_local_replica_slots, num_sms)
     _validate_grad_dtype(arena.dtype)

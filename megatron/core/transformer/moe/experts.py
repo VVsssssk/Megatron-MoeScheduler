@@ -342,6 +342,10 @@ class TEGroupedMLP(MegatronModule):
 
     def release_replica_expert_runtime(self, runtime) -> None:
         """Detach fused compute references only from the runtime that owns them."""
+        if self._replica_expert_runtime is None:
+            # A runtime may be destroyed before it is attached to this layer,
+            # including initialization failures and standalone transport use.
+            return
         if self._replica_expert_runtime is not runtime:
             raise RuntimeError("Cannot release a replica runtime owned by another layer.")
         self._fused_ops = None

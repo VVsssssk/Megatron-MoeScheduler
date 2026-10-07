@@ -10,6 +10,7 @@ from typing import Callable, List, Literal, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import squared_relu
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -2254,8 +2255,13 @@ class TransformerConfig(ModelParallelConfig):
                 ),
                 (self.moe_router_topk <= 32, "moe_router_topk<=32"),
                 (
-                    self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu),
-                    "fused SwiGLU or quick-GeGLU activation",
+                    (self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu))
+                    or (
+                        not self.gated_linear_unit
+                        and self.activation_func == squared_relu
+                        and self.use_fused_weighted_squared_relu
+                    ),
+                    "fused SwiGLU, quick-GeGLU or weighted squared-ReLU activation",
                 ),
                 (
                     (self.moe_latent_size or self.hidden_size) % 128 == 0,

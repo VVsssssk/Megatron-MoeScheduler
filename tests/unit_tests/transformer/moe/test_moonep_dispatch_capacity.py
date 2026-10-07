@@ -43,6 +43,7 @@ def _manager(monkeypatch, factor=None, alignment=256):
     manager.pad_multiple = None
     manager.moe_expert_rank_capacity_factor = factor
     manager.max_dispatch_routes_per_rank = None
+    manager.max_dispatch_padded_tokens_per_rank = None
     manager.over_budget = torch.zeros(1, dtype=torch.bool)
     monkeypatch.setattr(dispatch_module, "get_align_size_for_quantization", lambda _: alignment)
     return manager
@@ -81,6 +82,7 @@ def test_missing_guarantee_and_explicit_retry_remain_dynamic(monkeypatch):
     manager.setup_metadata(routing, probs)
     assert manager.num_permuted_tokens is not None
     manager.max_dispatch_routes_per_rank = None
+    manager.max_dispatch_padded_tokens_per_rank = None
     manager.setup_metadata(routing, probs)
     assert manager.num_permuted_tokens is None
     assert not manager._using_planner_capacity
@@ -165,7 +167,9 @@ def test_real_hybridep_quantization_padding(distributed_world):
                 assert manager._using_planner_capacity
                 assert isinstance(manager.num_permuted_tokens, int)
                 assert manager.num_permuted_tokens >= padded_demand > n * 2
-            y = manager.combine(dispatched * manager.dispatched_probs[:, None].to(dispatched.dtype))
+            y = manager.combine(
+                dispatched * manager.dispatched_probs[:, None].to(dispatched.dtype)
+            )
             y.float().square().sum().backward()
             assert not manager.over_budget.item()
             outputs.append((y.detach().clone(), x.grad.clone(), probs.grad.clone()))
@@ -208,16 +212,16 @@ def test_moonep_dynamic_vs_bounded_layer(distributed_world, monkeypatch, backend
     original_set = dispatch_module.MoEFlexTokenDispatcher.set_dispatch_route_bound
     observed = []
 
-    def record_bound(dispatcher, bound):
-        observed.append(bound)
-        return original_set(dispatcher, bound)
+    def record_bound(dispatcher, bound, **kwargs):
+        observed.append(kwargs["padded_tokens"])
+        return original_set(dispatcher, bound, **kwargs)
 
     try:
         with monkeypatch.context() as control:
             control.setattr(
                 dispatch_module.MoEFlexTokenDispatcher,
                 "set_dispatch_route_bound",
-                lambda dispatcher, bound: original_set(dispatcher, None),
+                lambda dispatcher, bound, **kwargs: original_set(dispatcher, None),
             )
             initial, reference, reference_dispatch = parity._run(
                 backend, pg, None, inputs, upstream
@@ -226,7 +230,9 @@ def test_moonep_dynamic_vs_bounded_layer(distributed_world, monkeypatch, backend
             dispatch_module.MoEFlexTokenDispatcher, "set_dispatch_route_bound", record_bound
         )
         _, actual, actual_dispatch = parity._run(backend, pg, initial, inputs, upstream)
-        assert observed == [x.shape[0] * 2 for x in inputs]
+        from megatron.core.transformer.moe.moonep_moe_scheduler import padded_rank_capacity
+
+        assert observed == [padded_rank_capacity(x.shape[0] * 2, 8, 4, 256) for x in inputs]
         assert not any(d["overflow"] for d in reference_dispatch + actual_dispatch)
         failures = []
         for name in reference:
@@ -242,3 +248,12 @@ def test_moonep_dynamic_vs_bounded_layer(distributed_world, monkeypatch, backend
         assert not any(reports), reports
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_block_capacity_is_not_padded_twice(monkeypatch):
+    manager = _manager(monkeypatch)
+    manager.max_dispatch_routes_per_rank = 768
+    manager.max_dispatch_padded_tokens_per_rank = 768
+    manager.setup_metadata(torch.zeros(256, 16, dtype=torch.bool), torch.zeros(256, 16))
+    assert manager.num_permuted_tokens == 768
+    assert manager._using_planner_capacity

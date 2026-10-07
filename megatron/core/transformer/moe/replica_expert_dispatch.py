@@ -106,7 +106,11 @@ class _ReplicaWaitGradReduce(torch.autograd.Function):
             # FSDP's unsharded communication bucket is not zero-initialized:
             # each microbatch overwrites it before reduce-scatter accumulates
             # into the persistent shard. DDP instead accumulates locally.
-            if getattr(parameter, "overwrite_main_grad", False):
+            if source_grad.data_ptr() == main_grad.data_ptr():
+                # Native GEMM and replica reduction already accumulated into DDP.
+                # Still return its hook trigger below, without adding the native twice.
+                pass
+            elif getattr(parameter, "overwrite_main_grad", False):
                 main_grad.copy_(source_grad)
             else:
                 main_grad.add_(source_grad)

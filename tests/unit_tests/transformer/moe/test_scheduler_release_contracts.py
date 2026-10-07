@@ -43,6 +43,22 @@ from tests.unit_tests.transformer.moe.test_replica_nccl_transport import distrib
 pytestmark = pytest.mark.launch_on_gb200
 
 
+def test_runtime_release_before_binding_preserves_native_compute():
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
+
+    native_ops, runtime = object(), object()
+    experts = SimpleNamespace(_replica_expert_runtime=None, _fused_ops=native_ops)
+    TEGroupedMLP.release_replica_expert_runtime(experts, runtime)
+    assert experts._fused_ops is native_ops
+    experts._replica_expert_runtime = runtime
+    with pytest.raises(RuntimeError, match="another layer"):
+        TEGroupedMLP.release_replica_expert_runtime(experts, object())
+    assert experts._replica_expert_runtime is runtime
+    TEGroupedMLP.release_replica_expert_runtime(experts, runtime)
+    assert experts._replica_expert_runtime is None
+    assert experts._fused_ops is None
+
+
 @pytest.mark.parametrize("capacity", [None, 1.5])
 @pytest.mark.parametrize("padding", [[False] * 12, [True, False, False] * 4, [True] * 12])
 def test_learned_padding_preserves_topk_and_zero_gradients(capacity, padding):

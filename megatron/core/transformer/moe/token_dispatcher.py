@@ -1119,6 +1119,7 @@ class _HybridEPManager(_DispatchManager):
 
         self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
         self.max_dispatch_routes_per_rank: Optional[int] = None
+        self.max_dispatch_padded_tokens_per_rank: Optional[int] = None
         self._using_planner_capacity = False
         self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
         # When runtime token equalization is enabled, HybridEP metadata and hidden
@@ -1167,7 +1168,11 @@ class _HybridEPManager(_DispatchManager):
             # A planner guarantee is distinct from an explicit user budget.
             # Never re-enable it during PagedStashRunner's explicit-budget retry.
             alignment = max(1, get_align_size_for_quantization(self.config))
-            capacity = self.max_dispatch_routes_per_rank + self.num_local_experts * (alignment - 1)
+            capacity = self.max_dispatch_padded_tokens_per_rank
+            if capacity is None:
+                capacity = self.max_dispatch_routes_per_rank + self.num_local_experts * (
+                    alignment - 1
+                )
             self.num_permuted_tokens = capacity + (-capacity % alignment)
             self._using_planner_capacity = True
         elif self.moe_expert_rank_capacity_factor is not None:
@@ -2122,8 +2127,17 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         else:
             return None
 
-    def set_dispatch_route_bound(self, max_routes: Optional[int]) -> None:
-        """Pass a per-forward planner guarantee to HybridEP, excluding padding."""
+    def set_dispatch_route_bound(
+        self, max_routes: Optional[int], *, padded_tokens: Optional[int] = None
+    ) -> None:
+        """Pass route and optional already-padded capacity guarantees to HybridEP."""
+        if padded_tokens is not None:
+            if (
+                max_routes is None
+                or not isinstance(padded_tokens, int)
+                or padded_tokens < max_routes
+            ):
+                raise ValueError("Padded capacity must be an integer at least the route bound.")
         if not isinstance(self._comm_manager, _HybridEPManager):
             if max_routes is not None:
                 raise ValueError("Planner dispatch capacity requires HybridEP.")
@@ -2134,6 +2148,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             if not isinstance(max_routes, int) or max_routes < 0:
                 raise ValueError("Planner dispatch route bound must be a non-negative integer.")
         self._comm_manager.max_dispatch_routes_per_rank = max_routes
+        self._comm_manager.max_dispatch_padded_tokens_per_rank = padded_tokens
 
     def reset_over_budget(self):
         """Reset the accumulated over-budget flag on the communication manager."""

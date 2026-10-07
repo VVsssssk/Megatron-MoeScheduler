@@ -82,6 +82,8 @@ def validate_scheduler_environment(
             raise RuntimeError("MoEScheduler clamped/quick-GeGLU requires TE ScaledClampedQGeGLU.")
         if config.activation_func.__name__ == "silu" and not is_te_min_version("2.17.0.dev0"):
             raise RuntimeError("MoEScheduler clamped SwiGLU requires TE >= 2.17.0.dev0.")
+    if config.activation_func.__name__ == "squared_relu" and not hasattr(ops, "ScaledSReLU"):
+        raise RuntimeError("MoEScheduler weighted squared-ReLU requires TE ScaledSReLU.")
     if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
         raise RuntimeError("MoEScheduler requires NVTE_CUTEDSL_FUSED_GROUPED_MLP=1.")
     if config.moe_scheduler_planner_type == "moon_ep" and group.size() > 1:
@@ -161,9 +163,12 @@ class MoEPlacementResult:
     ``max_dispatch_routes_per_rank`` is an optional public capacity guarantee:
     after rerouting, no rank receives more logical routes than this Python
     integer. It excludes per-expert transport padding. None makes no promise.
+    ``max_dispatch_padded_tokens_per_rank`` optionally bounds the full aligned
+    transport buffer instead; dispatch must not add expert padding a second time.
     """
 
     max_dispatch_routes_per_rank: int | None = None
+    max_dispatch_padded_tokens_per_rank: int | None = None
 
 
 def _validate_reroute_output(
@@ -304,6 +309,7 @@ class MoEScheduler(torch.nn.Module):
         self.expert_dispatch = expert_dispatch
         self.home_expert_dispatch = home_expert_dispatch
         self.max_dispatch_routes_per_rank: int | None = None
+        self.max_dispatch_padded_tokens_per_rank: int | None = None
 
     @classmethod
     def from_config(
@@ -347,10 +353,15 @@ class MoEScheduler(torch.nn.Module):
                 pg_collection=pg_collection,
             )
         else:
+            from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
             from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
 
             ep_size = getattr(config, "expert_model_parallel_size", 1)
-            planner = MoonEPLoadPlanner(num_redundant_experts=num_idle_experts // ep_size)
+
+            planner = MoonEPLoadPlanner(
+                num_redundant_experts=num_idle_experts // ep_size,
+                token_padding=max(1, get_align_size_for_quantization(config)),
+            )
         expert_dispatch = ReplicaExpertDispatch(config=config, pg_collection=pg_collection)
         config_signature = (
             str(planner_type),
@@ -492,6 +503,7 @@ class MoEScheduler(torch.nn.Module):
         """Plan token/expert rerouting and materialize the expert side."""
         # Bounds belong to this invocation, never a previous placement/shape.
         self.max_dispatch_routes_per_rank = None
+        self.max_dispatch_padded_tokens_per_rank = None
         home_expert_placement, replica_expert_placement, placement_result = (
             self.planner.update_placement(
                 probs, routing_map, context, tokens_per_expert=tokens_per_expert
@@ -521,6 +533,9 @@ class MoEScheduler(torch.nn.Module):
         )
         _validate_reroute_output(num_physical_experts, rerouted_routing_map, rerouted_probs)
         self.max_dispatch_routes_per_rank = placement_result.max_dispatch_routes_per_rank
+        self.max_dispatch_padded_tokens_per_rank = (
+            placement_result.max_dispatch_padded_tokens_per_rank
+        )
         self._log_first_schedule(
             routing_map,
             num_physical_experts,

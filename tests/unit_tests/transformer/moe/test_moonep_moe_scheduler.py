@@ -77,9 +77,10 @@ def test_moonep_planner_rejects_partial_replica_slots():
         )
 
 
-def test_moonep_planner_rejects_token_padding():
+@pytest.mark.parametrize("padding", [0, -1, True, 1.5])
+def test_moonep_planner_rejects_invalid_token_padding(padding):
     with pytest.raises(ValueError, match="token_padding"):
-        MoonEPLoadPlanner(num_redundant_experts=4, token_padding=2)
+        MoonEPLoadPlanner(num_redundant_experts=4, token_padding=padding)
 
 
 def test_moonep_planner_requires_ep_group_for_multi_ep():
