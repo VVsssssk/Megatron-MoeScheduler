@@ -777,7 +777,19 @@ class TEGroupedMLP(MegatronModule):
             tokens_per_expert = torch.tensor(
                 tokens_per_expert, dtype=torch.int, device=permuted_probs.device
             )
-        # if the number of tokens is 0, pad the hidden states to 256
+        # TE activation kernels cannot construct a TMA descriptor with zero
+        # rows. Execute one aligned group of zero-probability dummy tokens so
+        # that parameter hooks and their zero gradients still participate in
+        # distributed training. Slicing below restores the empty output.
+        empty_input = permuted_local_hidden_states.shape[0] == 0
+        if empty_input:
+            dummy_tokens = max(256, get_align_size_for_quantization(self.config))
+            permuted_local_hidden_states = F.pad(
+                permuted_local_hidden_states, (0, 0, 0, dummy_tokens)
+            )
+            permuted_probs = F.pad(permuted_probs, (0, dummy_tokens))
+            tokens_per_expert = torch.zeros_like(tokens_per_expert)
+            tokens_per_expert[0] = dummy_tokens
 
         if self.config.moe_paged_stash:
             permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
@@ -820,6 +832,8 @@ class TEGroupedMLP(MegatronModule):
             forced_released_tensors=forced_released_tensors,
             delay_offload=self.config.delay_offload_until_cuda_graph,
         )
+        if empty_input:
+            output = output[:0]
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
