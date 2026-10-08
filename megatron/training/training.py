@@ -2501,12 +2501,6 @@ def setup_model_and_optimizer(
             update_train_iters(args)
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
-        if getattr(args, "moe_scheduler_home_update_interval", 0):
-            from megatron.core.transformer.moe.home_expert_state import (
-                validate_home_expert_optimizer_config,
-            )
-
-            validate_home_expert_optimizer_config(config)
         config.timers = timers
         if getattr(args, "use_mup", False):
             model_config_source = (

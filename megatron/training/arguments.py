@@ -430,17 +430,6 @@ def tuple_type(x):
 
 def validate_args(args, defaults={}):
 
-    if getattr(args, "moe_scheduler_home_update_interval", 0):
-        from megatron.core.transformer.moe.home_expert_state import (
-            validate_home_expert_optimizer_config,
-        )
-
-        validate_home_expert_optimizer_config(args)
-        if args.skip_train and not (args.perform_rl_step and not args.no_load_optim):
-            raise ValueError(
-                "Home migration requires optimizer initialization; remove --skip-train."
-            )
-
     # Prep for checkpoint conversion.
     if args.ckpt_convert_format is not None:
         assert args.ckpt_convert_save is not None
@@ -2204,6 +2193,18 @@ def validate_args(args, defaults={}):
         assert (
             args.num_experts is not None
         ), "MoE latent projections are applicable only for MoE models."
+
+    # Validate the final optimizer options after defaults and argument normalization.
+    if getattr(args, "moe_scheduler_home_update_interval", 0):
+        from megatron.core.transformer.moe.home_expert_state import (
+            validate_home_expert_optimizer_config,
+        )
+
+        validate_home_expert_optimizer_config(args)
+        if args.skip_train and not (args.perform_rl_step and not args.no_load_optim):
+            raise ValueError(
+                "Home migration requires optimizer initialization; remove --skip-train."
+            )
 
     # Print arguments.
     _print_args("arguments", args)

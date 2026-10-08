@@ -42,6 +42,23 @@ _MXFP8_COMPONENTS = (
 )
 
 
+class _ReplicaFC2WgradStore:
+    """Start FC2 replica reduction immediately after TE enqueues its wgrad GEMM."""
+
+    context = None
+
+    def __init__(self, runtime: "ReplicaExpertRuntime") -> None:
+        self._runtime = runtime
+
+    @staticmethod
+    def delay_wgrad_compute() -> bool:
+        return True
+
+    def put(self, tensors: tuple, wgrad_gemm: Callable[..., None]) -> None:
+        wgrad_gemm(*tensors)
+        self._runtime.start_fc2_grad_reduce()
+
+
 @dataclass(frozen=True, eq=False)
 class ReplicaPlan:
     """Transport-facing result of replica placement planning.
@@ -677,6 +694,10 @@ class ReplicaExpertRuntime:
     def runtime_fc2_weights(self) -> tuple[torch.nn.Parameter, ...]:
         """Return stable native-then-virtual FC2 runtime parameters."""
         return self._runtime_weights(1)
+
+    def make_fc2_wgrad_store(self) -> _ReplicaFC2WgradStore:
+        """Create the TE callback that overlaps FC2 reduction with remaining backward work."""
+        return _ReplicaFC2WgradStore(self)
 
     def _runtime_weights(self, projection_index: int) -> tuple[torch.nn.Parameter, ...]:
         runtime_parameters = self.projections[projection_index].runtime_parameters

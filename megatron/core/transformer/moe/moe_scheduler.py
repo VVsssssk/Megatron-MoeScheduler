@@ -295,7 +295,7 @@ class ExpertDispatch(torch.nn.Module, ABC):
 class MoEScheduler(torch.nn.Module):
     """Small orchestrator that connects a planner to an expert dispatcher."""
 
-    _logged_config_signatures: ClassVar[set[tuple[str, str, int, str]]] = set()
+    _logged_config_signatures: ClassVar[set[tuple[str, str, int]]] = set()
     _logged_runtime_summary: ClassVar[bool] = False
 
     def __init__(
@@ -334,15 +334,12 @@ class MoEScheduler(torch.nn.Module):
             raise ValueError(
                 "moe_scheduler_num_idle_experts must be set when MoEScheduler is enabled."
             )
-        assignment_algorithm = getattr(
-            config, "moe_scheduler_assignment_algorithm", "one_shot_greedy"
-        )
 
         from megatron.core.transformer.moe.echo_moe_scheduler import EchoLoadPlanner
         from megatron.core.transformer.moe.replica_expert_dispatch import ReplicaExpertDispatch
 
         if planner_type == "echo":
-            planner = EchoLoadPlanner(num_idle_experts, assignment_algorithm=assignment_algorithm)
+            planner = EchoLoadPlanner(num_idle_experts)
         elif planner_type == "eplb":
             from megatron.core.transformer.moe.eplb_moe_scheduler import EPLBLoadPlanner
 
@@ -367,7 +364,6 @@ class MoEScheduler(torch.nn.Module):
             str(planner_type),
             str(expert_dispatcher_type),
             int(num_idle_experts),
-            str(assignment_algorithm),
         )
         if config_signature not in cls._logged_config_signatures:
             cls._logged_config_signatures.add(config_signature)
@@ -375,8 +371,7 @@ class MoEScheduler(torch.nn.Module):
                 "configured "
                 f"planner={planner_type} "
                 f"expert_dispatcher={expert_dispatcher_type} "
-                f"num_idle_experts={num_idle_experts} "
-                f"assignment_algorithm={assignment_algorithm}"
+                f"num_idle_experts={num_idle_experts}"
             )
         home_dispatch = None
         if getattr(config, "moe_scheduler_home_update_interval", 0):

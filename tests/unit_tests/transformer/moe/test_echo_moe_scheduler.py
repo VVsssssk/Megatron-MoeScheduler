@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -75,6 +76,8 @@ def _replica_dispatcher(num_idle_experts: int = 4) -> ReplicaExpertDispatch:
         moe_scheduler_expert_dispatcher_type="replica_peer_tma",
         grad_reduce_in_bf16=False,
         moe_flex_dispatcher_num_sms=None,
+        moe_scheduler_replica_storage="shared",
+        moe_scheduler_replica_mxfp8_storage="reuse",
     )
     return ReplicaExpertDispatch(config=config, pg_collection=SimpleNamespace(ep=_Group()))
 
@@ -159,15 +162,32 @@ def test_echo_planner_requires_ep_group_for_multi_ep():
         )
 
 
+class _RecordingRuntimeWorkspace:
+    def __init__(self):
+        self.workspace_acquired = False
+        self.workspace_events = []
+
+    def acquire_workspace(self):
+        assert not self.workspace_acquired
+        self.workspace_acquired = True
+        self.workspace_events.append("acquire")
+
+    def release_workspace(self):
+        assert self.workspace_acquired
+        self.workspace_acquired = False
+        self.workspace_events.append("release")
+
+
 def test_replica_dispatch_lowers_placement_to_runtime_plan():
     context = _echo_context()
     physical_to_logical_map = torch.tensor([[2], [0]])
     dispatcher = _replica_dispatcher(num_idle_experts=2)
 
-    class _Runtime:
+    class _Runtime(_RecordingRuntimeWorkspace):
         source_parameters = ()
 
         def __init__(self):
+            super().__init__()
             self.last_plan = None
             self.started_plan = None
 
@@ -186,6 +206,7 @@ def test_replica_dispatch_lowers_placement_to_runtime_plan():
 
     dispatcher.after_token_combine(torch.ones(1))
     assert dispatcher._active_plan is None
+    assert runtime.workspace_events == ["acquire", "release"]
 
 
 def test_replica_dispatch_binds_transport_backed_runtime(monkeypatch):
@@ -224,6 +245,8 @@ def test_replica_dispatch_binds_transport_backed_runtime(monkeypatch):
     assert captured["transport_dispatcher_type"] == "replica_peer_tma"
     assert captured["transport_config"] is transport_config
     assert captured["grad_dtype"] == torch.float32
+    assert captured["replica_storage"] == "shared"
+    assert captured["replica_mxfp8_storage"] == "reuse"
 
 
 def test_replica_transport_factory_uses_expert_dispatcher_type(monkeypatch):
@@ -245,10 +268,11 @@ def test_replica_dispatch_preserves_runtime_backward_order():
     events = []
     parameter = torch.nn.Parameter(torch.ones(()))
 
-    class _Runtime:
+    class _Runtime(_RecordingRuntimeWorkspace):
         source_parameters = (parameter,)
 
         def __init__(self):
+            super().__init__()
             self.last_plan = None
 
         def start_prefetch(self, plan):
@@ -257,6 +281,7 @@ def test_replica_dispatch_preserves_runtime_backward_order():
 
         def start_backward_prefetch(self, plan):
             del plan
+            self.acquire_workspace()
             events.append("backward_prefetch")
 
         def wait_prefetch_for_backward(self, plan):
@@ -309,6 +334,7 @@ def test_replica_dispatch_preserves_runtime_backward_order():
         "wait_grad_reduce",
     ]
     assert not any(slot.in_use for slot in dispatcher._plan_slots)
+    assert dispatcher.runtime.workspace_events == ["acquire", "release", "acquire", "release"]
     torch.testing.assert_close(parameter.grad, torch.ones_like(parameter))
 
 
@@ -529,6 +555,9 @@ def test_moe_layer_scheduler_helper_uses_unified_scheduler_output():
     physical_routing_map[:, 1] = routing_map[:, 1]
 
     class _RecordingScheduler:
+        max_dispatch_routes_per_rank = 4
+        max_dispatch_padded_tokens_per_rank = 256
+
         def __init__(self):
             self.probs = None
             self.routing_map = None
@@ -549,6 +578,7 @@ def test_moe_layer_scheduler_helper_uses_unified_scheduler_output():
     layer = object.__new__(MoELayer)
     layer.moe_scheduler = _RecordingScheduler()
     layer.experts = object()
+    layer.token_dispatcher = Mock(spec=["set_dispatch_route_bound"])
     layer.num_logical_experts = 4
     layer.num_local_home_experts = 4
     layer.local_home_expert_indices = [0, 1, 2, 3]
@@ -573,6 +603,7 @@ def test_moe_layer_scheduler_helper_uses_unified_scheduler_output():
     assert layer.moe_scheduler.context.layer_number == 7
     assert layer.moe_scheduler.context.num_logical_experts == 4
     assert layer.moe_scheduler.context.num_local_experts == 4
+    layer.token_dispatcher.set_dispatch_route_bound.assert_called_once_with(4, padded_tokens=256)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

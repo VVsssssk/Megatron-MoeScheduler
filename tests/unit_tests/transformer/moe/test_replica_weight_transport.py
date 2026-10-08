@@ -172,6 +172,29 @@ def test_runtime_repeated_wait_retains_completion_and_rejects_stale_plan():
         runtime.wait_prefetch(first)
 
 
+def test_fc2_wgrad_callback_reduces_only_after_a_successful_gemm():
+    runtime = _runtime()
+    events = []
+    runtime.start_fc2_grad_reduce = lambda: events.append("reduce")
+    store = runtime.make_fc2_wgrad_store()
+    assert store.delay_wgrad_compute()
+    assert store.context is None
+
+    def gemm(left, right):
+        events.append((left, right))
+
+    store.put(("input", "grad_output"), gemm)
+    assert events == [("input", "grad_output"), "reduce"]
+    events.clear()
+
+    def failing_gemm():
+        raise RuntimeError("GEMM failed")
+
+    with pytest.raises(RuntimeError, match="GEMM failed"):
+        store.put((), failing_gemm)
+    assert not events
+
+
 def test_runtime_gradient_handoff_keeps_fc2_first_and_reuses_the_backward_plan():
     runtime = _runtime()
     plan = _plan()

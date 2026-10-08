@@ -181,23 +181,6 @@ class GroupedMLPSubmodules:
     """
 
 
-class _ReplicaFC2WgradStore:
-    """Start FC2 replica reduction immediately after TE enqueues its wgrad GEMM."""
-
-    context = None
-
-    def __init__(self, runtime) -> None:
-        self._runtime = runtime
-
-    @staticmethod
-    def delay_wgrad_compute() -> bool:
-        return True
-
-    def put(self, tensors, wgrad_gemm) -> None:
-        wgrad_gemm(*tensors)
-        self._runtime.start_fc2_grad_reduce()
-
-
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
@@ -660,7 +643,7 @@ class TEGroupedMLP(MegatronModule):
         # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
         if replica_runtime is not None:
             register_replica_weights(op, replica_runtime.runtime_fc2_weights)
-            op.wgrad_store = _ReplicaFC2WgradStore(replica_runtime)
+            op.wgrad_store = replica_runtime.make_fc2_wgrad_store()
         else:
             register_grouped_linear_params(
                 op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias

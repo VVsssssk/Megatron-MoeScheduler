@@ -977,15 +977,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_scheduler_num_idle_experts: Optional[int] = None
     """Number of transient physical expert slots added across the EP group.
 
-    The ``moon_ep`` planner follows the PR #6892 replica planner and requires
+    The ``moon_ep`` planner follows the PR #7450 replica planner and requires
     this to equal ``num_moe_experts``.
     """
 
     moe_scheduler_home_update_interval: int = 0
     """Successful optimizer steps between EPLB home proposals; zero keeps homes fixed."""
-
-    moe_scheduler_assignment_algorithm: Literal['one_shot_greedy'] = "one_shot_greedy"
-    """Scheduler planner assignment algorithm. """
 
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
@@ -2133,10 +2130,6 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_enable_scheduler:
-            if self.moe_scheduler_assignment_algorithm != "one_shot_greedy":
-                raise ValueError(
-                    "ECHO supports only moe_scheduler_assignment_algorithm='one_shot_greedy'."
-                )
             if self.moe_scheduler_expert_dispatcher_type == "replica_hybridep":
                 raise ValueError(
                     "replica_hybridep is not implemented; select replica_peer_tma or replica_nccl."

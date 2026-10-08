@@ -2,6 +2,7 @@
 
 """Learned routing, initialization, and logical-checkpoint release contracts."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -124,7 +125,6 @@ def test_learned_padding_runs_distributed_moonep(distributed_world):
 @pytest.mark.parametrize(
     "overrides,match",
     [
-        ({"moe_scheduler_assignment_algorithm": "approx_bin_packing"}, "one_shot_greedy"),
         ({"moe_scheduler_expert_dispatcher_type": "replica_hybridep"}, "not implemented"),
         ({"expert_model_parallel_size": 128}, "at most 64"),
         ({"moe_scheduler_planner_type": "moon_ep", "num_moe_experts": 16384}, "8192"),
@@ -148,6 +148,33 @@ def test_algorithm_rejections_happen_in_config(overrides, match):
 def test_optimizer_representation_rejected_before_allocation(option):
     with pytest.raises(ValueError, match="resident uncompressed"):
         validate_home_expert_optimizer_config(SimpleNamespace(**{option: True}))
+
+
+@pytest.mark.parametrize("precision_aware", [False, True])
+def test_home_optimizer_validation_uses_resolved_training_arguments(monkeypatch, precision_aware):
+    from megatron.training.arguments import parse_args, validate_args
+
+    monkeypatch.setattr(sys, "argv", ["test_scheduler_release_contracts.py"])
+    args = parse_args()
+    args.num_layers = 2
+    args.vocab_size = 256
+    args.hidden_size = 64
+    args.num_attention_heads = 4
+    args.max_position_embeddings = args.seq_length = 128
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = "NullTokenizer"
+    args.moe_scheduler_home_update_interval = 1
+    # Defaults are applied inside validate_args, after the former early check.
+    args.use_precision_aware_optimizer = None
+    defaults = {"use_precision_aware_optimizer": precision_aware}
+    if precision_aware:
+        with pytest.raises(ValueError, match="resident uncompressed"):
+            validate_args(args, defaults)
+    else:
+        validated = validate_args(args, defaults)
+        assert validated.use_precision_aware_optimizer is False
 
 
 def test_environment_rejects_missing_cuda_before_group_or_storage(monkeypatch):

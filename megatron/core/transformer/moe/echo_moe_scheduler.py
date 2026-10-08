@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 import torch
 
@@ -25,8 +25,6 @@ except ImportError:
     triton = None
     tl = None
     HAVE_TRITON = False
-
-EchoAssignmentAlgorithm = Literal["one_shot_greedy"]
 
 
 @dataclass(frozen=True)
@@ -398,19 +396,12 @@ def _echo_depth_first_allocation(
 
 
 def _echo_update_placement_impl(
-    counts_from_ep_rank: torch.Tensor,
-    ep_rank: int,
-    ep_size: int,
-    num_echo_experts: int,
-    assignment_algorithm: EchoAssignmentAlgorithm,
+    counts_from_ep_rank: torch.Tensor, ep_rank: int, ep_size: int, num_echo_experts: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return the physical layout and local state needed by the reroute phase."""
-    if assignment_algorithm == "one_shot_greedy":
-        home_to_echo_counts = _echo_compute_one_shot_assignment(
-            counts_from_ep_rank, ep_size, num_echo_experts
-        )
-    else:
-        raise ValueError(f"Unsupported Echo assignment algorithm: {assignment_algorithm}")
+    home_to_echo_counts = _echo_compute_one_shot_assignment(
+        counts_from_ep_rank, ep_size, num_echo_experts
+    )
 
     first_pass, counts_after_first, remaining_capacity = _echo_breadth_first_allocation(
         counts_from_ep_rank, home_to_echo_counts
@@ -478,7 +469,6 @@ class EchoLoadPlanner(MoELoadPlanner):
         self,
         num_echo_experts: int,
         *,
-        assignment_algorithm: EchoAssignmentAlgorithm = "one_shot_greedy",
         enable_random_offloading: bool = False,
         random_seed: int = 42,
         use_triton: bool = True,
@@ -487,10 +477,7 @@ class EchoLoadPlanner(MoELoadPlanner):
         super().__init__()
         if num_echo_experts < 0:
             raise ValueError("num_echo_experts must be non-negative.")
-        if assignment_algorithm != "one_shot_greedy":
-            raise ValueError(f"Unsupported Echo assignment algorithm: {assignment_algorithm}")
         self.num_echo_experts = num_echo_experts
-        self.assignment_algorithm = assignment_algorithm
         self.enable_random_offloading = enable_random_offloading
         self.random_seed = random_seed
         self.use_triton = use_triton
@@ -515,10 +502,6 @@ class EchoLoadPlanner(MoELoadPlanner):
             raise ValueError(
                 "EchoLoadPlanner requires num_echo_experts to be divisible by ep_size."
             )
-
-    def _resolved_assignment_algorithm(self, context: SchedulerContext) -> str:
-        del context
-        return self.assignment_algorithm
 
     def _get_count_matrix(
         self,
@@ -747,13 +730,9 @@ class EchoLoadPlanner(MoELoadPlanner):
             count_from_home[context.ep_rank] = home_to_echo_counts.sum(dim=1)
             counts_after = counts_from_ep_rank - count_from_home
         else:
-            algorithm = self._resolved_assignment_algorithm(context)
-            if algorithm == "one_shot_greedy":
-                home_to_echo_counts, spillover, capacity, assignment_backend = (
-                    self._compute_one_shot_assignment(counts_from_ep_rank, context)
-                )
-            else:
-                raise ValueError(f"Unsupported Echo assignment algorithm: {algorithm}")
+            home_to_echo_counts, spillover, capacity, assignment_backend = (
+                self._compute_one_shot_assignment(counts_from_ep_rank, context)
+            )
 
             first_pass, counts_after_first, remaining_capacity = self._breadth_first_allocation(
                 counts_from_ep_rank, home_to_echo_counts
@@ -899,11 +878,7 @@ class EchoLoadPlanner(MoELoadPlanner):
                 local_echo_counts,
                 local_home_counts,
             ) = _get_compiled_echo_placement()(
-                counts_from_ep_rank,
-                context.ep_rank,
-                context.ep_size,
-                self.num_echo_experts,
-                self._resolved_assignment_algorithm(context),
+                counts_from_ep_rank, context.ep_rank, context.ep_size, self.num_echo_experts
             )
             return (
                 None,
