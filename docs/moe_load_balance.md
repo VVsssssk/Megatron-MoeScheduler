@@ -748,3 +748,19 @@ This is separate from scheduler placement or dispatch capacity. Nonempty inputs
 retain the existing path. `test_fused_expert_empty_rank.py` exercises real TE,
 HybridEP, DDP and distributed Adam with all routed work concentrated on one of
 four ranks and checks zero expert gradients on the other ranks.
+
+## Replica parameter-hook lifetime across optimizer steps
+
+Forward prefetch invokes the native expert parameter hooks before reading
+source weights, then marks that preparation for consumption by the fused MLP
+forward hook. Backward prefetch also prepares native storage, but must not
+mark a subsequent forward as prepared: no fused forward hook follows it.
+The `for_backward` phase explicitly clears the forward-prepared flag.
+Otherwise, after optimizer update, the next forward can skip DDP
+`finish_param_sync` and read incomplete MXFP8 all-gather data. This applies
+to all planners and replica transports; the scheduler-disabled path retains
+its existing forward-hook behavior.
+
+A forward/backward/update/forward regression checks that each forward
+prefetch waits for the current weight generation and that the fused forward
+does not duplicate hooks already run by its own forward prefetch.

@@ -676,9 +676,9 @@ class TEGroupedMLP(MegatronModule):
 
         return forward_pre_hook
 
-    def prepare_fused_impl_parameters(self) -> None:
-        """Run fused-op parameter hooks before planner-side weight prefetch."""
-        if self._fused_impl_parameters_prepared:
+    def prepare_fused_impl_parameters(self, *, for_backward: bool = False) -> None:
+        """Run parameter hooks without carrying backward preparation into forward."""
+        if self._fused_impl_parameters_prepared and not for_backward:
             return
         for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
             for hook in submodule._forward_pre_hooks.values():
@@ -690,7 +690,11 @@ class TEGroupedMLP(MegatronModule):
                         "modifies the input tensor."
                     )
         self._ensure_main_grad_for_fused_impl()
-        self._fused_impl_parameters_prepared = True
+        # Only a forward prefetch may satisfy the next fused forward hook.
+        # Backward prefetch is not followed by that hook. Leaving this flag
+        # set skips DDP finish_param_sync after the next optimizer update,
+        # exposing incomplete MXFP8 parameter all-gather buffers to the GEMM.
+        self._fused_impl_parameters_prepared = not for_backward
 
     @staticmethod
     def _ensure_main_grad(linear_module: torch.nn.Module) -> None:

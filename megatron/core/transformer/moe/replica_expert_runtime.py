@@ -720,10 +720,10 @@ class ReplicaExpertRuntime:
         experts = self._experts_ref()
         if experts is None:
             raise RuntimeError("Replica experts were destroyed before prefetch.")
-        experts.prepare_fused_impl_parameters()
+        backward = direction is _WeightDirection.BACKWARD
+        experts.prepare_fused_impl_parameters(for_backward=backward)
         # Expert backward computes FC2 before FC1; keep GTP's linked gathers in
         # the order they will be consumed.
-        backward = direction is _WeightDirection.BACKWARD
         for projection in reversed(self.projections) if backward else self.projections:
             leader = projection.gtp_leader
             if leader is None:

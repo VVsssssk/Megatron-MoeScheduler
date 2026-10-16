@@ -108,6 +108,7 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
 )
 from megatron.core.rerun_state_machine import (
+    EXIT_CODE_FAILED_ON_RESULT_VALIDATION,
     RerunDataIterator,
     RerunMode,
     destroy_rerun_state_machine,
@@ -4458,7 +4459,7 @@ def train(
                 and should_setup_fault_injection_at_iteration(fault_injector_config, iteration)
             ):
                 setup_fault_injection(fault_injector_config)
-        if should_checkpoint:
+        if should_checkpoint and args.save is not None:
             save_checkpoint_and_time(
                 iteration,
                 model,
@@ -4468,6 +4469,18 @@ def train(
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
             )
+        elif should_checkpoint:
+            # Result validation may request a diagnostic checkpoint even when
+            # normal checkpointing is disabled. Preserve the failed outcome
+            # instead of passing None to the checkpoint path builder or
+            # advertising a resumable checkpoint that was never written.
+            print_rank_0(
+                "Result validation requested a diagnostic checkpoint, but --save is unset. "
+                "Exiting on validation failure without a checkpoint; set --save to enable "
+                "cross-GPU rerun diagnostics."
+            )
+            should_exit = True
+            exit_code = EXIT_CODE_FAILED_ON_RESULT_VALIDATION
         if should_exit:
             break
 
